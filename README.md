@@ -1,10 +1,15 @@
 # rss_reader
-
-
 rss_reader is a Python script that reads RSS feed and displays it in various formats.
 
+## Installation
+To start using the script, type the following commands in the directory that contains downloaded files:
 
-usage: `rss_reader.py [-h] [--version] [--json] [--verbose] [--limit LIMIT] source`
+```shell
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+## Usage
+`rss_reader.py [-h] [--version] [--json] [--verbose] [--limit LIMIT] source`
 
 | Option           | Description
 |------------------|--------------------------------------------
@@ -15,6 +20,28 @@ usage: `rss_reader.py [-h] [--version] [--json] [--verbose] [--limit LIMIT] sour
 | `--verbose`      | Outputs verbose status messages
 | `--limit LIMIT`  | Limit news topics if this parameter provided
 
+Example of generated JSON:
+```json
+{
+  "title": "Name of RSS feed",
+  "entries": [
+    {
+      "title": "RSS feed item title",
+      "published": "2022-08-20",
+      "link": "http:\\example.com",
+      "description": "RSS feed item description"
+    }
+  ]
+}
+```
+| JSON Field  | Location | Description
+|-------------|----------|--------------------------------------------
+| title       |          | Title of the RSS feed
+| entries     |          | Array of RSS feed items
+| title       | entries  | Title of the RSS feed item
+| published   | entries  | The date and time the RSS feed item was published
+| link        | entries  | Link to RSS feed item
+| description | entries  | Description of the RSS feed item
 
 ## Testing
 
