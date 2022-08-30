@@ -1,3 +1,4 @@
+[![codecov](https://codecov.io/gh/DiPal2/rss/branch/main/graph/badge.svg?token=1BHVHPRAVU)](https://codecov.io/gh/DiPal2/rss)
 # rss_reader
 rss_reader is a Python script that reads RSS feed and displays it in various formats.
 
