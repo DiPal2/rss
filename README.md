@@ -1,15 +1,22 @@
 [![codecov](https://codecov.io/gh/DiPal2/rss/branch/main/graph/badge.svg?token=1BHVHPRAVU)](https://codecov.io/gh/DiPal2/rss)
+[![code style](https://github.com/DiPal2/rss/actions/workflows/code_style.yml/badge.svg)](https://github.com/DiPal2/rss/actions/workflows/code_style.yml)
+[![test](https://github.com/DiPal2/rss/actions/workflows/test.yml/badge.svg)](https://github.com/DiPal2/rss/actions/workflows/test.yml)
+[![smoke run](https://github.com/DiPal2/rss/actions/workflows/smoke_run.yml/badge.svg)](https://github.com/DiPal2/rss/actions/workflows/smoke_run.yml)
+
 # rss_reader
+
 rss_reader is a Python script that reads RSS feed and displays it in various formats.
 
 ## Installation
-To start using the script, type the following commands in the directory that contains downloaded files:
 
-```shell
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
+To start using the script you need [Python 3.9 with installed pip and setuptools](https://www.python.org/downloads/)
+
+Type `python setup.py install` or `pip install -e .` in the directory containing the content from this repository.
+
+After that you can use `rss_reader` from any folder or `rss_reader.py` located in **rss_reader** folder.
+
 ## Usage
+
 `rss_reader.py [-h] [--version] [--json] [--verbose] [--limit LIMIT] source`
 
 | Option           | Description
@@ -46,13 +53,33 @@ Example of generated JSON:
 
 ## Testing
 
-To run tests, type the following commands in the directory that contains downloaded files:
+To run tests you need [Python 3.9 with installed pip and setuptools](https://www.python.org/downloads/).
 
+Type the following commands in the directory containing the content from this repository:
 ```shell
-python -m venv venv
-source venv/bin/activate  # or "venv\Scripts\activate.ps1" on Windows
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-pip install -r requirements_dev.txt
+pip install -e .[tests]
 pytest
+```
+or
+```shell
+pip install -r requirements_tests.txt
+pytest
+```
+
+
+## Development
+
+To start development you need [Python 3.9 with installed pip and setuptools](https://www.python.org/downloads/).
+
+Install required packages by typing `pip install -e .[develop]` or `pip install -r requirements_dev.txt` in the directory containing the content from this repository.
+
+You can control code style by running the following commands:
+```shell
+black --check --diff .
+pycodestyle setup.py rss_reader tests
+pylint rss_reader
+pylint setup.py --disable=exec-used
+pylint tests --disable=redefined-outer-name
+mypy --disallow-untyped-defs rss_reader
+mypy setup.py tests
 ```

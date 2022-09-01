@@ -1,0 +1,42 @@
+name: "smoke run"
+
+on: [push]
+
+jobs:
+  smoke:
+    name: "Smoke run in Python ${{ matrix.python-version }} on ${{ matrix.os}}"
+
+    runs-on: "${{ matrix.os }}"
+
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        python-version:
+          - "3.8"
+          - "3.9"
+          - "3.10"
+      fail-fast: false
+
+    steps:
+      - name: Checkout the repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v3
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install App
+        id: install
+        run: python setup.py install
+        continue-on-error: true
+
+      - name: Check expected result from install
+        run: python -c "import sys; version_supported = sys.version_info >= (3, 9); setup_succeeded = '${{ steps.install.outcome }}' == 'success'; assert version_supported and setup_succeeded or not version_supported and not setup_succeeded"
+
+      - name: Smoke Run
+        if: steps.install.outcome == 'success' 
+        run: rss_reader https://feeds.washingtonpost.com/rss/world --limit 2
