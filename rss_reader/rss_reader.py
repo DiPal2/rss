@@ -2,20 +2,24 @@
 
 from abc import ABC, abstractmethod
 import argparse
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Iterable, Iterator
+from datetime import date, datetime
 from functools import wraps
 import inspect
 import json
 import logging
+from pathlib import Path
+import pickle
 import shutil
 import sys
-from typing import Iterator, Optional, Any
+from typing import Any, Optional
+import uuid
 import xml.etree.ElementTree as ET
 
 from html2text import HTML2Text
 import requests
 
-__version_info__ = ("0", "2", "0")
+__version_info__ = ("0", "3", "0")
 __version__ = ".".join(__version_info__)
 
 
@@ -61,32 +65,53 @@ class NotRssContent(RssReaderError):
     """
 
 
-class FeedToDict:
+class FeedContentReader(ABC, Iterator):
     """
-    A class used for converting RSS feed content to Iterable dictionaries
+    An abstract class used to read feed from various sources
+    """
+
+    @abstractmethod
+    def read_header(self) -> dict[str, str]:
+        """
+        Reads feed header
+        :return: a dictionary with header elements
+        """
+        raise NotImplementedError
+
+    def __iter__(self) -> Iterator[dict[str, str]]:
+        return self
+
+    @abstractmethod
+    def __next__(self) -> dict[str, str]:
+        """
+        Reads next feed entry
+        :return: a dictionary with entry elements
+        """
+        raise NotImplementedError
+
+
+class StringFeedReader(FeedContentReader):
+    """
+    A class used to read feed from a string
     """
 
     _REMAP_FIELDS = {"pubDate": "published"}
 
     _FEED_ITEM = "item"
 
-    def __init__(self, content: str, maximum: int):
+    def __init__(self, content: str):
         """
-        Init a feed and constructs all the necessary attributes
-        :param content: string that contains RSS feed
-        :param maximum: an int that limits processing of items in the feed
-                        (0 means no limit)
+        Init feed reading from string and constructs all the necessary attributes
+        :param content: a string with feed content
         :raise NotRssContent
         """
-        self._num: int
-        self._iter: Generator[ET.Element, None, None]
-        self._max = maximum
-        logging.info("Feed started parsing")
+        logging.info("Feed started parsing from string")
         try:
             root = ET.fromstring(content)
             if root.tag == "rss" and root[0].tag == "channel":
                 logging.info("%s with version %s", root.tag, root.get("version"))
                 self._feed = root[0]
+                self._iter = self._feed.iter(self._FEED_ITEM)
             else:
                 raise NotRssContent
         except Exception as ex:
@@ -95,34 +120,202 @@ class FeedToDict:
 
     def _xml_children_to_dict(
         self, xml_element: ET.Element, stop_element_name: Optional[str] = None
-    ) -> dict:
-        result = {}
+    ) -> dict[str, str]:
+        result: dict[str, str] = {}
         for child in xml_element:
             if stop_element_name and child.tag == stop_element_name:
                 break
             logging.info("XML: %s [%s] with %s", child.tag, child.text, child.attrib)
             key = self._REMAP_FIELDS.get(child.tag, child.tag)
-            result[key] = child.text
+            if child.text:
+                result[key] = child.text
         return result
 
+    def read_header(self) -> dict[str, str]:
+        return self._xml_children_to_dict(self._feed, self._FEED_ITEM)
+
+    def __next__(self) -> dict[str, str]:
+        return self._xml_children_to_dict(self._iter.__next__())
+
+
+class WebFeedReader(StringFeedReader):  # pylint: disable=too-few-public-methods
+    """
+    A class used to read feed from a web URL
+    """
+
+    def __init__(self, url: str):
+        """
+        Load web URL content and init feed reading from it
+        :param url: an address of a feed
+        :raise ContentUnreachable
+        """
+        logging.info("Loading feed content from %s", url)
+        try:
+            request = requests.get(url, timeout=600)
+            logging.info("Received response %s", request.status_code)
+        except Exception as ex:
+            logging.info("Loading feed content failed with %s", ex)
+            raise ContentUnreachable from ex
+        super().__init__(request.text)
+
+
+class FeedWriteCache(ABC):
+    """
+    An abstract class used to write feed in cache
+    """
+
+    @abstractmethod
+    def write_header(self, data: dict[str, str]) -> None:
+        """
+        Writes feed header in cache
+        :param data: a dictionary with feed header items
+        :return: Nothing
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def write_entry(self, data: dict[str, str]) -> None:
+        """
+        Writes feed entry element in cache
+        :param data: a dictionary with feed entry element
+        :return: Nothing
+        """
+        raise NotImplementedError
+
+
+class FeedFileCache:  # pylint: disable=too-few-public-methods
+    """
+    A class used to work with file cache
+    """
+
+    CACHE_FOLDER = "461ef83d954b475a80334c2135e9115c"
+    MAP_FILE = "feeds.bin"
+    HEADER_FILE = "header.bin"
+
+    def __init__(self) -> None:
+        self._folder = Path(__file__).parent.resolve() / self.CACHE_FOLDER
+        self._map_file = self._folder / self.MAP_FILE
+        self._folder.mkdir(exist_ok=True)
+        logging.info("Cache folder %s", self._folder)
+
+    @call_logger("file_name")
+    def _save_cache(self, file_name: Path, data: dict[str, str]) -> None:
+        with open(file_name, "wb") as file:
+            pickle.dump(data, file)
+
+    @call_logger("file_name")
+    def _load_cache(self, file_name: Path) -> dict[str, str]:
+        try:
+            with open(file_name, "rb") as file:
+                result = pickle.load(file)
+                if isinstance(result, dict):
+                    return result
+                logging.info("Cache %s loaded garbage", file_name)
+        except Exception as ex:  # pylint: disable=broad-except
+            logging.info("Cache load %s raised an exception '%s'", file_name, ex)
+        return {}
+
+    def _feed_to_path(self, url: str) -> Path:
+        mapper = self._load_cache(self._map_file)
+        if url not in mapper:
+            cache_folder = uuid.uuid4().hex
+            logging.info("Adding url %s to cache %s", url, cache_folder)
+            mapper[url] = cache_folder
+            self._save_cache(self._map_file, mapper)
+
+        feed_path = self._folder / mapper[url]
+        logging.info("Using url %s with cache: %s", url, feed_path)
+        feed_path.mkdir(exist_ok=True)
+        return feed_path
+
+
+class FeedWriteFileCache(FeedFileCache, FeedWriteCache):
+    """
+    A class used to write feed content to file cache
+    """
+
+    def __init__(self, url: str) -> None:
+        """
+        Init feed cache for writing
+        :param url: an address of a feed
+        """
+        super().__init__()
+        self._feed = self._feed_to_path(url)
+
+    def write_header(self, data: dict[str, str]) -> None:
+        self._save_cache(self._feed / self.HEADER_FILE, data)
+
+    def write_entry(self, data: dict[str, str]) -> None:
+        pass
+
+
+class FeedReadFileCache(FeedFileCache, FeedContentReader):
+    """
+    A class used to read feed content from file cache
+    """
+
+    def __init__(self, date_filter: date, url: str) -> None:
+        """
+        Init feed cache for reading
+        :param date_filter: a filter for published date
+        :param url: an address of a feed
+        """
+        super().__init__()
+        self._feed = self._feed_to_path(url)
+        self._date_filter = date_filter
+
+    def read_header(self) -> dict[str, str]:
+        return self._load_cache(self._feed / self.HEADER_FILE)
+
+    def __next__(self) -> dict[str, str]:
+        raise StopIteration
+
+
+class ContentIterator(Iterator):
+    """
+    A class used for iterating through feed content
+    """
+
+    def __init__(
+        self,
+        content_reader: FeedContentReader,
+        maximum: Optional[int] = None,
+        write_cache: Optional[FeedWriteCache] = None,
+    ):
+        """
+        Constructs all the necessary attributes
+        :param content_reader: a FeedContentReader class for traversing through feed
+        :param maximum: an int that limits processing of items in the feed (optional)
+        :param write_cache: a FeedWriteCache class for storing data in cache (optional)
+        :raise NotRssContent
+        """
+        self._num = 0
+        self._content_reader = content_reader
+        self._max = None if maximum == 0 else maximum
+        self._write_cache = write_cache
+
     @property
-    def feed_info(self) -> dict:
+    def feed_info(self) -> dict[str, str]:
         """
         Feed header info
         :return: a dictionary with header elements
         """
-        return self._xml_children_to_dict(self._feed, self._FEED_ITEM)
+        result = self._content_reader.read_header()
+        if self._write_cache:
+            self._write_cache.write_header(result)
+        return result
 
-    def __iter__(self) -> Iterator:
+    def __iter__(self) -> Iterator[dict[str, str]]:
         self._num = 0
-        self._iter = self._feed.iter(self._FEED_ITEM)
         return self
 
-    def __next__(self) -> dict:
-        if self._max == 0 or self._num < self._max:
-            item = self._iter.__next__()
+    def __next__(self) -> dict[str, str]:
+        if not self._max or self._num < self._max:
+            result = self._content_reader.__next__()
             self._num += 1
-            return self._xml_children_to_dict(item)
+            if self._write_cache:
+                self._write_cache.write_entry(result)
+            return result
         raise StopIteration
 
 
@@ -149,7 +342,7 @@ class AbstractRenderer(ABC):
         return self._html.handle(value)[:-2]
 
     def _render_fields(
-        self, fields: tuple, data: dict, processor: Callable[[str, str], None]
+        self, fields: tuple, data: dict[str, str], processor: Callable[[str, str], None]
     ) -> None:
         for field in fields:
             if field in data:
@@ -158,18 +351,18 @@ class AbstractRenderer(ABC):
 
     @call_logger("data")
     def _render_header_fields(
-        self, data: dict, processor: Callable[[str, str], None]
+        self, data: dict[str, str], processor: Callable[[str, str], None]
     ) -> None:
         self._render_fields(self.FEED_FIELDS, data, processor)
 
     @call_logger("data")
     def _render_entry_fields(
-        self, data: dict, processor: Callable[[str, str], None]
+        self, data: dict[str, str], processor: Callable[[str, str], None]
     ) -> None:
         self._render_fields(self.ENTRY_FIELDS, data, processor)
 
     @abstractmethod
-    def render_header(self, data: dict) -> None:
+    def render_header(self, data: dict[str, str]) -> None:
         """
         Render feed header
         :param data: a dictionary with header elements
@@ -178,10 +371,10 @@ class AbstractRenderer(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def render_entry(self, data: dict) -> None:
+    def render_entries(self, entries: Iterable[dict[str, str]]) -> None:
         """
         Render feed entry
-        :param data: a dictionary with entry elements
+        :param entries: an iterable with dictionaries containing entry elements
         :return: Nothing
         """
         raise NotImplementedError
@@ -211,17 +404,18 @@ class TextRenderer(AbstractRenderer):
             "description": "\n{}",
         }
 
-    def render_header(self, data: dict) -> None:
+    def render_header(self, data: dict[str, str]) -> None:
         def processor(key: str, value: str) -> None:
             print(self._header_formats[key].format(value))
 
         self._render_header_fields(data, processor)
 
-    def render_entry(self, data: dict) -> None:
+    def render_entries(self, entries: Iterable[dict[str, str]]) -> None:
         def processor(key: str, value: str) -> None:
             print(self._entry_formats[key].format(value))
 
-        self._render_entry_fields(data, processor)
+        for data in entries:
+            self._render_entry_fields(data, processor)
 
     def render_exit(self) -> None:
         pass
@@ -235,9 +429,8 @@ class JsonRenderer(AbstractRenderer):
     def __init__(self) -> None:
         super().__init__()
         self._json: dict = {}
-        self._json_entries: list = []
 
-    def render_header(self, data: dict) -> None:
+    def render_header(self, data: dict[str, str]) -> None:
         result = {}
 
         def processor(key: str, value: str) -> None:
@@ -246,51 +439,44 @@ class JsonRenderer(AbstractRenderer):
         self._render_header_fields(data, processor)
         self._json.update(result)
 
-    def render_entry(self, data: dict) -> None:
-        result = {}
+    def render_entries(self, entries: Iterable[dict[str, str]]) -> None:
+        final = []
 
         def processor(key: str, value: str) -> None:
             result[key] = value
 
-        self._render_entry_fields(data, processor)
-        self._json_entries.append(result)
+        for data in entries:
+            result: dict = {}
+            self._render_entry_fields(data, processor)
+            final.append(result)
+
+        self._json["entries"] = final
 
     def render_exit(self) -> None:
-        self._json["entries"] = self._json_entries
         print(json.dumps(self._json))
 
 
-def url_loader(url: str) -> str:
-    """
-    Load content from URL
-    :param url: an address
-    :return: a string with content
-    """
-    logging.info("Loading content from %s", url)
-    try:
-        request = requests.get(url, timeout=600)
-        logging.info("Received response %s", request.status_code)
-    except Exception as ex:
-        logging.info("Loading content failed with %s", ex)
-        raise ContentUnreachable from ex
-    return request.text
-
-
-def feed_processor(url: str, limit: int = 0, is_json: bool = False) -> None:
+def feed_processor(
+    url: str,
+    limit: Optional[int] = None,
+    is_json: bool = False,
+    date_filter: Optional[date] = None,
+) -> None:
     """
     Performs loading and displaying of the RSS feed
     :param url: an address of the RSS feed
-    :param limit: an int that limits processing of items in the feed
-                 (0 means no limit)
+    :param limit: an int that limits processing of items in the feed (0 means no limit)
     :param is_json: should data be displayed in JSON format
+    :param date_filter: should cache be used to filter by published date
     :return: Nothing
     """
-    content = url_loader(url)
-    feed = FeedToDict(content, limit)
+    if date_filter:
+        feed = ContentIterator(FeedReadFileCache(date_filter, url), limit)
+    else:
+        feed = ContentIterator(WebFeedReader(url), limit, FeedWriteFileCache(url))
     renderer = JsonRenderer() if is_json else TextRenderer()
     renderer.render_header(feed.feed_info)
-    for item in feed:
-        renderer.render_entry(item)
+    renderer.render_entries(feed)
     renderer.render_exit()
 
 
@@ -304,6 +490,13 @@ def main() -> None:
         if result < 0:
             raise argparse.ArgumentTypeError(f"{value} is not a non-negative int value")
         return result
+
+    def check_date(value: str) -> date:
+        try:
+            return datetime.strptime(value, "%Y%m%d").date()
+        except ValueError as exc:
+            msg = f"{value} is not a date in YYYYMMDD format"
+            raise argparse.ArgumentTypeError(msg) from exc
 
     parser = argparse.ArgumentParser(description="Pure Python command-line RSS reader.")
     parser.add_argument("url", metavar="source", type=str, help="RSS URL")
@@ -324,18 +517,24 @@ def main() -> None:
         type=check_non_negative,
         help="Limit news topics if this parameter provided",
     )
+    parser.add_argument(
+        "--date",
+        metavar="DATE",
+        type=check_date,
+        help="Limit news to only cached data with such published date (YYYYMMDD)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(format="%(asctime)s %(message)s", level=args.log_level)
 
     try:
-        feed_processor(args.url, args.limit or 0, args.json)
+        feed_processor(args.url, args.limit, args.json, args.date)
     except ContentUnreachable:
         print("Error happened as content cannot be loaded from", args.url)
     except NotRssContent:
         print("Error happened as there is no RSS at", args.url)
     except Exception as ex:
-        logging.info("Exception was raised %s", ex)
+        logging.info("Exception was raised '%s'", ex)
         print("Error happened during program execution.")
         raise
 
