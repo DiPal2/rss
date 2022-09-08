@@ -2,41 +2,52 @@
 
 from abc import ABC, abstractmethod
 import argparse
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Iterable
+from contextlib import AbstractContextManager
+from datetime import date, datetime, time, timedelta, timezone
 from functools import wraps
 import inspect
 import json
 import logging
+from pathlib import Path
+import pickle
 import shutil
 import sys
-from typing import Iterator, Optional, Any
+from typing import Any, BinaryIO, Optional
+import uuid
 import xml.etree.ElementTree as ET
 
+import dateparser
 from html2text import HTML2Text
 import requests
 
-__version_info__ = ("0", "2", "0")
+__version_info__ = ("0", "3", "2")
 __version__ = ".".join(__version_info__)
 
 
 def call_logger(*args_to_log: str) -> Callable:
     """
     Decorator to log function call with arguments of interest
-    :param args_to_log: names of arguments to be shown
-    :return: decorator
+
+    :param args_to_log:
+        names of arguments to be shown
+
+    :return:
+        decorator
     """
 
     def decorate(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            arg_names = inspect.getfullargspec(func).args
-            args_repr = [
-                f"{k}={v!r}" for k, v in zip(arg_names, args) if k in args_to_log
-            ]
+            arg_with_names = zip(inspect.getfullargspec(func).args, args)
+            args_repr = [f"{k}={v!r}" for k, v in arg_with_names if k in args_to_log]
             kwargs_repr = [f"{k}={v!r}" for k, v in kwargs.items() if k in args_to_log]
             all_args_repr = ", ".join(args_repr + kwargs_repr)
             logging.info("%s called with %s", func.__name__, all_args_repr)
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
+            if result:
+                logging.info("%s returned %s", func.__name__, result)
+            return result
 
         return wrapper
 
@@ -61,72 +72,563 @@ class NotRssContent(RssReaderError):
     """
 
 
-class FeedToDict:
+class CacheEmpty(RssReaderError):
     """
-    A class used for converting RSS feed content to Iterable dictionaries
+    Exception for empty cache
+    """
+
+
+class CacheIssue(RssReaderError):
+    """
+    Cache failure exception
+    """
+
+
+FeedData = dict[str, str]
+
+
+class CacheFeedWriter(ABC):
+    """
+    An abstract class used to write feed in cache
+    """
+
+    @abstractmethod
+    def write_header(self, data: FeedData) -> None:
+        """
+        Writes feed header in cache
+
+        :param data:
+            a FeedData for header
+
+        :return:
+            Nothing
+        """
+
+    @abstractmethod
+    def write_entry(self, data: FeedData) -> None:
+        """
+        Writes feed entry element in cache
+
+        :param data:
+            a FeedData for entry
+
+        :return:
+            Nothing
+        """
+
+
+class FeedSource(ABC):
+    """
+    An abstract class for a feed source
+    """
+
+    @abstractmethod
+    def read_header(self) -> FeedData:
+        """
+        Reads and transform feed header
+
+        :return:
+            A FeedData for header
+        """
+
+    @abstractmethod
+    def entry_iter(self) -> Iterable[FeedData]:
+        """
+        Iterates over feed items
+
+        :return:
+            An Iterable of FeedData for entries
+        """
+
+
+class FeedMiddleware:
+    """
+    A class used to abstract feed(s) source with feed processor
+    """
+
+    def __init__(
+        self, source: FeedSource, cache_writer: Optional[CacheFeedWriter] = None
+    ):
+        self._source = source
+        self._cache_writer = cache_writer
+        self._entry_count = 0
+
+    @property
+    def header(self) -> FeedData:
+        """
+        Returns feed header
+
+        :return:
+            A FeedData for header
+        """
+        header = self._source.read_header()
+        if self._cache_writer:
+            self._cache_writer.write_header(header)
+        return header
+
+    def entries(self, maximum: Optional[int] = None) -> Iterable[FeedData]:
+        """
+        Returns feed entries as an Iterable
+
+        :param maximum:
+            an int that limits processing of feed items
+
+        :return:
+            An Iterable of FeedData entries
+        """
+        self._entry_count = 0
+        for item in self._source.entry_iter():
+            if self._cache_writer:
+                self._cache_writer.write_entry(item)
+            self._entry_count += 1
+            yield item
+            if maximum and self._entry_count >= maximum:
+                return
+
+    @property
+    def processed_entries(self) -> int:
+        """
+        A number of entries processed in the feed
+
+        :return:
+            a number of processed entries
+        """
+        return self._entry_count
+
+
+class StringFeedReader(FeedSource):
+    """
+    A class used to read a feed from a string
     """
 
     _REMAP_FIELDS = {"pubDate": "published"}
 
     _FEED_ITEM = "item"
 
-    def __init__(self, content: str, maximum: int):
+    def __init__(self, content: str):
         """
-        Init a feed and constructs all the necessary attributes
-        :param content: string that contains RSS feed
-        :param maximum: an int that limits processing of items in the feed
-                        (0 means no limit)
-        :raise NotRssContent
+        Init feed reading from string and constructs all the necessary attributes
+
+        :param content:
+            a string with feed content
+
+        :raises NotRssContent:
+            raised for non-RSS content
         """
-        self._num: int
-        self._iter: Generator[ET.Element, None, None]
-        self._max = maximum
-        logging.info("Feed started parsing")
+
+        logging.info("StringFeedReader started")
         try:
             root = ET.fromstring(content)
-            if root.tag == "rss" and root[0].tag == "channel":
-                logging.info("%s with version %s", root.tag, root.get("version"))
-                self._feed = root[0]
-            else:
-                raise NotRssContent
         except Exception as ex:
-            logging.info("XML parsing failed with %s", ex)
+            logging.info("XML parsing failed with '%s'", ex)
             raise NotRssContent from ex
+
+        if root.tag == "rss" and root[0].tag == "channel":
+            logging.info("%s with version %s", root.tag, root.get("version"))
+            self._feed = root[0]
+        else:
+            raise NotRssContent
 
     def _xml_children_to_dict(
         self, xml_element: ET.Element, stop_element_name: Optional[str] = None
-    ) -> dict:
-        result = {}
+    ) -> FeedData:
+        result: FeedData = {}
         for child in xml_element:
             if stop_element_name and child.tag == stop_element_name:
                 break
             logging.info("XML: %s [%s] with %s", child.tag, child.text, child.attrib)
             key = self._REMAP_FIELDS.get(child.tag, child.tag)
-            result[key] = child.text
+            if child.text:
+                result[key] = child.text
         return result
 
-    @property
-    def feed_info(self) -> dict:
-        """
-        Feed header info
-        :return: a dictionary with header elements
-        """
+    def read_header(self) -> FeedData:
         return self._xml_children_to_dict(self._feed, self._FEED_ITEM)
 
-    def __iter__(self) -> Iterator:
-        self._num = 0
-        self._iter = self._feed.iter(self._FEED_ITEM)
+    def entry_iter(self) -> Iterable[FeedData]:
+        for item in self._feed.iter(self._FEED_ITEM):
+            yield self._xml_children_to_dict(item)
+
+
+class WebFeedReader(StringFeedReader):  # pylint: disable=too-few-public-methods
+    """
+    A class used to read a feed from a web URL
+    """
+
+    def __init__(self, url: str):
+        """
+        Load web URL content and init feed reading from it
+
+        :param url:
+            an address of a feed
+
+        :raises ContentUnreachable:
+            raised when content cannot be loaded
+        """
+        logging.info("WebFeedReader started for %s", url)
+        try:
+            request = requests.get(url, timeout=600)
+            logging.info("WebFeedReader got response %s", request.status_code)
+        except Exception as ex:
+            logging.info("WebFeedReader failed with '%s'", ex)
+            raise ContentUnreachable from ex
+        super().__init__(request.text)
+
+
+class FileCache(AbstractContextManager):
+    """
+    A context manager for saving and loading cache files
+    """
+
+    def __init__(self, file_name: Path):
+        try:
+            if not file_name.exists():
+                file_name.parent.mkdir(parents=True, exist_ok=True)
+                file_name.touch(exist_ok=True)
+        except Exception as ex:
+            logging.info("FileCache for %s cannot prepare path: %s", file_name, ex)
+            raise CacheIssue from ex
+        self._file_name = file_name
+        self._file: BinaryIO
+
+    def __enter__(self) -> "FileCache":
+        try:
+            self._file = open(self._file_name, "rb+")
+        except Exception as ex:
+            logging.info("FileCache for %s cannot be opened: %s", self._file_name, ex)
+            raise CacheIssue from ex
         return self
 
-    def __next__(self) -> dict:
-        if self._max == 0 or self._num < self._max:
-            item = self._iter.__next__()
-            self._num += 1
-            return self._xml_children_to_dict(item)
-        raise StopIteration
+    def __exit__(self, *exc_details: Any) -> None:
+        self._file.close()
+
+    def load(self) -> dict:
+        """
+        Loads the cache file into a dictionary
+
+        :return:
+            A dictionary
+        """
+        logging.info("FileCache load called for %s", self._file_name)
+        try:
+            if self._file_name.stat().st_size == 0:
+                data = {}
+            else:
+                data = pickle.load(self._file)
+        except Exception as ex:
+            logging.info("FileCache for %s cannot be loaded: %s", self._file_name, ex)
+            raise CacheIssue from ex
+        if not isinstance(data, dict):
+            logging.info("FileCache for %s loaded garbage", self._file_name)
+            raise CacheIssue
+        return data
+
+    def save(self, data: dict) -> None:
+        """
+        Saves a dictionary to the cache file
+
+        :param data:
+            A dictionary to be saved
+
+        :return:
+            Nothing
+        """
+        logging.info("FileCache save called for %s", self._file_name)
+        try:
+            self._file.seek(0)
+            pickle.dump(data, self._file)
+        except Exception as ex:
+            logging.info("FileCache for %s cannot be saved: %s", self._file_name, ex)
+            raise CacheIssue from ex
 
 
-class AbstractRenderer(ABC):
+FileCacheMapEntry = tuple[str, Optional[datetime], bool]
+
+
+class FileCacheFeedReader(FeedSource):
+    """
+    A class used to read a feed from file cache
+    """
+
+    def __init__(self, header_file: Path, entries: list[Path]):
+        """
+        Init feed reading from a file cache and constructs all the necessary attributes
+
+        :param header_file:
+            a Path to header file
+
+        :param entries:
+            a list of Paths to entries files
+        """
+        self._header_file = header_file
+        self._entries = entries
+
+    def read_header(self) -> FeedData:
+        with FileCache(self._header_file) as cache:
+            result: FeedData = cache.load()
+        return result
+
+    def entry_iter(self) -> Iterable[FeedData]:
+        for item in self._entries:
+            with FileCache(item) as cache:
+                result: FeedData = cache.load()
+                yield result
+
+
+class FileCacheFeedMapper:
+    """
+    A class used to map a feed to a cache folder
+    """
+
+    def __init__(self) -> None:
+        self._folder = self.cache_folder()
+        logging.info("Cache folder %s", self._folder)
+        self._map_file = self._folder / "feeds.bin"
+
+    @staticmethod
+    def cache_folder() -> Path:
+        """
+        Get cache folder location
+
+        :return:
+            Path
+        """
+        home = Path.home()
+        if sys.platform.startswith("win"):
+            cache_dir = home / "AppData" / "Roaming"
+        elif sys.platform.startswith("darwin"):
+            cache_dir = home / "Library" / "Application Support"
+        else:
+            cache_dir = home / ".local" / "share"
+        return cache_dir / "rss_reader"
+
+    @staticmethod
+    def reset_cache() -> None:
+        """
+        Erase existing cache
+
+        :return:
+            Nothing
+        """
+        FileCacheFeedMapper._rmdir(FileCacheFeedMapper.cache_folder())
+        print("Cache was erased successfully")
+
+    @staticmethod
+    def _rmdir(folder: Path) -> None:
+        if not folder.exists():
+            return
+        try:
+            for item in folder.iterdir():
+                if item.is_file() or item.is_symlink():
+                    item.unlink(missing_ok=True)
+                elif item.is_dir():
+                    FileCacheFeedMapper._rmdir(item)
+            folder.rmdir()
+            logging.info("Removed empty folder %s", folder)
+        except Exception as ex:
+            logging.info("_rmdir %s failed with '%s'", folder, ex)
+            raise CacheIssue from ex
+
+    def feed_to_path(self, url: str) -> Path:
+        """
+        Converts a feed url to an appropriate cache folder
+
+        :param url:
+            a web address of a feed
+
+        :return:
+            a Path to a cache folder
+        """
+        with FileCache(self._map_file) as cache:
+            mapper = cache.load()
+            current = mapper.get(url)
+            if not current:
+                current = 1 + max(mapper.values()) if mapper else 1
+                logging.info("Adding url %s to cache %s", url, current)
+                mapper[url] = current
+                cache.save(mapper)
+
+        feed_path: Path = self._folder / str(current)
+        logging.info("Using url %s with cache: %s", url, feed_path)
+        return feed_path
+
+    def get_map(self) -> dict[str, Path]:
+        """
+        Returns full map between feed urls and cache folders
+
+        :return:
+            a dictionary of urls with feed cache Path
+        """
+        with FileCache(self._map_file) as cache:
+            mapper = cache.load()
+        return {key: self._folder / str(value) for key, value in mapper.items()}
+
+
+class FileCacheFeedHelper:
+    """
+    A class used to work with file cache for feeds
+    """
+
+    HEADER_FILE = "header.bin"
+    ENTRIES_MAP_FILE = "entries.bin"
+    GUID_FIELD = "guid"
+
+    @staticmethod
+    def _entry_full_path(feed_path: Path, map_entry: FileCacheMapEntry) -> Path:
+        file_name, entry_datetime, _ = map_entry
+        if entry_datetime:
+            return (
+                feed_path
+                / str(entry_datetime.year)
+                / str(entry_datetime.month)
+                / str(entry_datetime.day)
+                / file_name
+            )
+        return feed_path / file_name
+
+    @staticmethod
+    def _entry_datetime(map_entry: FileCacheMapEntry) -> Optional[datetime]:
+        return map_entry[1]
+
+    def _filter_feed_entries(self, feed: Path, date_filter: date) -> list[Path]:
+        mapper = self._load_map_of_entries(feed)
+        local_tz = datetime.now(timezone.utc).astimezone().tzinfo
+        date_from = datetime.combine(date_filter, time.min, local_tz)
+        date_to = date_from + timedelta(days=1)
+        filtered = []
+        for value in mapper.values():
+            entry_datetime = self._entry_datetime(value)
+            if entry_datetime and date_from <= entry_datetime < date_to:
+                filtered.append(self._entry_full_path(feed, value))
+        return filtered
+
+    def filter_entries(
+        self, date_filter: date, url: Optional[str] = None
+    ) -> list[FeedMiddleware]:
+        """
+        Filter cached data by date and optionally by url
+
+        :param date_filter:
+            a local date that should filter cached feed items by published date
+
+        :param url:
+            an exact feed address that should filter cached feeds
+
+        :return:
+            a list of FeedMiddleware
+
+        :raises CacheEmpty:
+            raised when there is no filtered data
+        """
+        filtered = []
+        feeds = FileCacheFeedMapper().get_map()
+
+        if url:
+            feeds = {url: feeds[url]} if url in feeds else {}
+
+        for feed_path in feeds.values():
+            if entries := self._filter_feed_entries(feed_path, date_filter):
+                feed_reader = FileCacheFeedReader(feed_path / self.HEADER_FILE, entries)
+                filtered.append(FeedMiddleware(feed_reader))
+
+        if filtered:
+            return filtered
+
+        raise CacheEmpty
+
+    @call_logger("feed_path")
+    def _load_map_of_entries(self, feed_path: Path) -> dict:
+        with FileCache(feed_path / self.ENTRIES_MAP_FILE) as cache:
+            entries_map: dict = cache.load()
+        return entries_map
+
+    def _is_good_entry_in_map(self, feed_path: Path, data: FeedData) -> bool:
+        if self.GUID_FIELD not in data:
+            return False
+        guid = data[self.GUID_FIELD]
+        mapper = self._load_map_of_entries(feed_path)
+        if guid not in mapper:
+            return False
+        file_name, _, is_dirty = mapper[guid]
+        logging.info(
+            "%s entry %s exists in cache: %s",
+            "Dirty" if is_dirty else "Good",
+            guid,
+            file_name,
+        )
+        return not is_dirty
+
+    @staticmethod
+    def new_cache_map_entry(data: FeedData) -> FileCacheMapEntry:
+        """
+        Creates FileCacheMapEntry based on FeedData
+
+        :param data:
+            FeedData
+
+        :return:
+            FileCacheMapEntry
+        """
+        file_name = f"{uuid.uuid4().hex}.bin"
+        entry_datetime: Optional[datetime] = None
+        if value := data.get("published"):
+            try:
+                entry_datetime = dateparser.parse(value)
+            except Exception as ex:  # pylint: disable=broad-except
+                logging.info("datetime [%s] parsing failed with '%s'", value, ex)
+        now_utc = datetime.now(timezone.utc)
+        is_dirty = not entry_datetime or now_utc - entry_datetime < timedelta(hours=4)
+
+        return file_name, entry_datetime, is_dirty
+
+    @call_logger("file_name", "data")
+    def _add_entry_to_map(
+        self, feed_path: Path, data: FeedData, cache_map_entry: FileCacheMapEntry
+    ) -> None:
+        guid = data.get(self.GUID_FIELD)
+        if not guid:
+            logging.info("Entry does not have guid")
+            return
+
+        with FileCache(feed_path / self.ENTRIES_MAP_FILE) as cache:
+            mapper = cache.load()
+            mapper[guid] = cache_map_entry
+            cache.save(mapper)
+
+
+class FileCacheFeedWriter(FileCacheFeedHelper, CacheFeedWriter):
+    """
+    A class used to write feed content to file cache
+    """
+
+    def __init__(self, url: str) -> None:
+        """
+        Init feed cache for writing
+
+        :param url:
+            an address of a feed
+        """
+        super().__init__()
+        self._feed = FileCacheFeedMapper().feed_to_path(url)
+
+    def write_header(self, data: FeedData) -> None:
+        with FileCache(self._feed / self.HEADER_FILE) as cache:
+            cache.save(data)
+
+    def write_entry(self, data: FeedData) -> None:
+        if self._is_good_entry_in_map(self._feed, data):
+            return
+        if cache_map_entry := self.new_cache_map_entry(data):
+            full_name = self._entry_full_path(self._feed, cache_map_entry)
+            with FileCache(full_name) as cache:
+                cache.save(data)
+            self._add_entry_to_map(self._feed, data, cache_map_entry)
+
+
+FieldValueProcessor = Callable[[str, str], None]
+
+
+class Renderer(ABC):
     """
     An abstract class used for rendering feed
     """
@@ -144,12 +646,13 @@ class AbstractRenderer(ABC):
         self._html.images_to_alt = True
         self._html.default_image_alt = "image"
         self._html.single_line_break = True
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
 
     def _from_html(self, value: str) -> str:
         return self._html.handle(value)[:-2]
 
     def _render_fields(
-        self, fields: tuple, data: dict, processor: Callable[[str, str], None]
+        self, fields: tuple, data: FeedData, processor: FieldValueProcessor
     ) -> None:
         for field in fields:
             if field in data:
@@ -158,44 +661,42 @@ class AbstractRenderer(ABC):
 
     @call_logger("data")
     def _render_header_fields(
-        self, data: dict, processor: Callable[[str, str], None]
+        self, data: FeedData, processor: FieldValueProcessor
     ) -> None:
         self._render_fields(self.FEED_FIELDS, data, processor)
 
     @call_logger("data")
     def _render_entry_fields(
-        self, data: dict, processor: Callable[[str, str], None]
+        self, data: FeedData, processor: FieldValueProcessor
     ) -> None:
         self._render_fields(self.ENTRY_FIELDS, data, processor)
 
     @abstractmethod
-    def render_header(self, data: dict) -> None:
+    def render_feed(self, header: FeedData, entries: Iterable[FeedData]) -> None:
         """
-        Render feed header
-        :param data: a dictionary with header elements
-        :return: Nothing
-        """
-        raise NotImplementedError
+        Render feed header and entries
 
-    @abstractmethod
-    def render_entry(self, data: dict) -> None:
+        :param header:
+            a dictionary with header elements
+
+        :param entries:
+            an iterable with FeedData for entries
+
+        :return:
+            Nothing
         """
-        Render feed entry
-        :param data: a dictionary with entry elements
-        :return: Nothing
-        """
-        raise NotImplementedError
 
     @abstractmethod
     def render_exit(self) -> None:
         """
         Finish rendering
-        :return: Nothing
+
+        :return:
+            Nothing
         """
-        raise NotImplementedError
 
 
-class TextRenderer(AbstractRenderer):
+class TextRenderer(Renderer):
     """
     A class used for rendering feed as a text in console
     """
@@ -211,90 +712,104 @@ class TextRenderer(AbstractRenderer):
             "description": "\n{}",
         }
 
-    def render_header(self, data: dict) -> None:
-        def processor(key: str, value: str) -> None:
+    def render_feed(self, header: FeedData, entries: Iterable[FeedData]) -> None:
+        def header_processor(key: str, value: str) -> None:
             print(self._header_formats[key].format(value))
 
-        self._render_header_fields(data, processor)
-
-    def render_entry(self, data: dict) -> None:
-        def processor(key: str, value: str) -> None:
+        def entry_processor(key: str, value: str) -> None:
             print(self._entry_formats[key].format(value))
 
-        self._render_entry_fields(data, processor)
+        self._render_header_fields(header, header_processor)
+
+        for data in entries:
+            self._render_entry_fields(data, entry_processor)
 
     def render_exit(self) -> None:
         pass
 
 
-class JsonRenderer(AbstractRenderer):
+class JsonRenderer(Renderer):
     """
     A class used for rendering feed as JSON
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self._json: dict = {}
-        self._json_entries: list = []
+        self._json: list[dict] = []
 
-    def render_header(self, data: dict) -> None:
-        result = {}
+    def render_feed(self, header: FeedData, entries: Iterable[FeedData]) -> None:
+        feed_json: dict = {}
+        result: dict = {}
+        items = []
 
-        def processor(key: str, value: str) -> None:
+        def header_processor(key: str, value: str) -> None:
+            feed_json[key] = value
+
+        def entry_processor(key: str, value: str) -> None:
             result[key] = value
 
-        self._render_header_fields(data, processor)
-        self._json.update(result)
+        self._render_header_fields(header, header_processor)
 
-    def render_entry(self, data: dict) -> None:
-        result = {}
+        for data in entries:
+            result = {}
+            self._render_entry_fields(data, entry_processor)
+            items.append(result)
 
-        def processor(key: str, value: str) -> None:
-            result[key] = value
-
-        self._render_entry_fields(data, processor)
-        self._json_entries.append(result)
+        feed_json["entries"] = items
+        self._json.append(feed_json)
 
     def render_exit(self) -> None:
-        self._json["entries"] = self._json_entries
         print(json.dumps(self._json))
 
 
-def url_loader(url: str) -> str:
-    """
-    Load content from URL
-    :param url: an address
-    :return: a string with content
-    """
-    logging.info("Loading content from %s", url)
-    try:
-        request = requests.get(url, timeout=600)
-        logging.info("Received response %s", request.status_code)
-    except Exception as ex:
-        logging.info("Loading content failed with %s", ex)
-        raise ContentUnreachable from ex
-    return request.text
-
-
-def feed_processor(url: str, limit: int = 0, is_json: bool = False) -> None:
+def feed_processor(
+    url: Optional[str] = None,
+    limit: Optional[int] = None,
+    is_json: bool = False,
+    date_filter: Optional[date] = None,
+) -> None:
     """
     Performs loading and displaying of the RSS feed
-    :param url: an address of the RSS feed
-    :param limit: an int that limits processing of items in the feed
-                 (0 means no limit)
-    :param is_json: should data be displayed in JSON format
-    :return: Nothing
+
+    :param url:
+        an address of the RSS feed
+
+    :param limit:
+        an int that limits processing of items in the feed (0 means no limit)
+
+    :param is_json:
+        should data be displayed in JSON format
+
+    :param date_filter:
+        should cache be used to filter by published date
+
+    :return:
+        Nothing
     """
-    content = url_loader(url)
-    feed = FeedToDict(content, limit)
-    renderer = JsonRenderer() if is_json else TextRenderer()
-    renderer.render_header(feed.feed_info)
-    for item in feed:
-        renderer.render_entry(item)
+
+    if limit == 0:
+        limit = None
+
+    if date_filter:
+        feeds = FileCacheFeedHelper().filter_entries(date_filter, url)
+    elif url:
+        feeds = [FeedMiddleware(WebFeedReader(url), FileCacheFeedWriter(url))]
+    else:
+        raise ValueError
+
+    renderer: Renderer = JsonRenderer() if is_json else TextRenderer()
+
+    for feed in feeds:
+        renderer.render_feed(feed.header, feed.entries(limit))
+        if limit:
+            limit -= feed.processed_entries
+        if limit == 0:
+            break
+
     renderer.render_exit()
 
 
-def main() -> None:
+def main() -> None:  # pylint: disable=too-many-statements
     """
     CLI for feed processing
     """
@@ -305,8 +820,16 @@ def main() -> None:
             raise argparse.ArgumentTypeError(f"{value} is not a non-negative int value")
         return result
 
+    def check_date(value: str) -> date:
+        try:
+            return datetime.strptime(value, "%Y%m%d").date()
+        except ValueError as exc:
+            msg = f"{value} is not a date in YYYYMMDD format"
+            raise argparse.ArgumentTypeError(msg) from exc
+
     parser = argparse.ArgumentParser(description="Pure Python command-line RSS reader.")
-    parser.add_argument("url", metavar="source", type=str, help="RSS URL")
+    group = parser.add_argument_group("content")
+    group.add_argument("url", nargs="?", type=str, help="RSS URL", metavar="source")
     parser.add_argument("--version", action="version", version=f"Version {__version__}")
     parser.add_argument(
         "--json", action="store_true", help="Print result as JSON in stdout"
@@ -324,20 +847,44 @@ def main() -> None:
         type=check_non_negative,
         help="Limit news topics if this parameter provided",
     )
+    group.add_argument("--cleanup", action="store_true", help="Clear cached data")
+    group.add_argument(
+        "--date",
+        metavar="DATE",
+        type=check_date,
+        help="Limit news to only cached data with such published date (YYYYMMDD)",
+    )
+
     args = parser.parse_args()
+    if not (args.url or args.date or args.cleanup):
+        parser.error("No content provided, add source or --date or --cleanup")
+    if args.cleanup and args.date:
+        parser.error("--cleanup cannot be used with --date")
 
     logging.basicConfig(format="%(asctime)s %(message)s", level=args.log_level)
 
     try:
-        feed_processor(args.url, args.limit or 0, args.json)
+        logging.info("Parsed arguments: %s", args)
+        if args.cleanup:
+            FileCacheFeedMapper.reset_cache()
+        if args.url or args.date:
+            feed_processor(args.url, args.limit, args.json, args.date)
     except ContentUnreachable:
         print("Error happened as content cannot be loaded from", args.url)
+        sys.exit(10)
     except NotRssContent:
         print("Error happened as there is no RSS at", args.url)
-    except Exception as ex:
-        logging.info("Exception was raised %s", ex)
+        sys.exit(20)
+    except CacheEmpty:
+        print("Error happened as there is no data in cache for", args.date)
+        sys.exit(30)
+    except CacheIssue:
+        print("Working with cache failed. Try calling script with --cleanup")
+        sys.exit(40)
+    except Exception as ex:  # pylint: disable=broad-except
+        logging.info("Exception was raised '%s'", ex)
         print("Error happened during program execution.")
-        raise
+        raise  # sys.exit(100)
 
 
 if __name__ == "__main__":
