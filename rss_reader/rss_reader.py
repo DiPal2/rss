@@ -1,11 +1,14 @@
 """Reads RSS feed and displays it in various formats"""
+# pylint: disable=too-many-lines
 
 from abc import ABC, abstractmethod
-import argparse
+from argparse import ArgumentParser, ArgumentTypeError, Namespace
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
 from datetime import date, datetime, time, timedelta, timezone
 from functools import wraps
+import html
+from html.parser import HTMLParser
 import inspect
 import json
 import logging
@@ -21,7 +24,7 @@ import dateparser
 from html2text import HTML2Text
 import requests
 
-__version_info__ = ("0", "3", "2")
+__version_info__ = ("0", "4", "0")
 __version__ = ".".join(__version_info__)
 
 
@@ -84,6 +87,12 @@ class CacheIssue(RssReaderError):
     """
 
 
+class ExportIssue(RssReaderError):
+    """
+    Export failure exception
+    """
+
+
 FeedData = dict[str, str]
 
 
@@ -119,7 +128,7 @@ class CacheFeedWriter(ABC):
 
 class FeedSource(ABC):
     """
-    An abstract class for a feed source
+    An abstract class for reading feed from a source
     """
 
     @abstractmethod
@@ -141,6 +150,62 @@ class FeedSource(ABC):
         """
 
 
+class FeedRenderer(ABC):
+    """
+    An abstract class used for rendering feed
+    """
+
+    FEED_FIELDS = ("title",)
+    ENTRY_FIELDS = (
+        "title",
+        "published",
+        "link",
+        "description",
+    )
+
+    @abstractmethod
+    def render_feed_start(self, header: FeedData) -> None:
+        """
+        Starts feed rendering with header data
+
+        :param header:
+            FeedData with header elements
+
+        :return:
+            Nothing
+        """
+
+    @abstractmethod
+    def render_feed_entry(self, entry: FeedData) -> None:
+        """
+        Render feed entry
+
+        :param entry:
+            FeedData with entry elements
+
+        :return:
+            Nothing
+        """
+
+    @abstractmethod
+    def render_feed_end(self) -> None:
+        """
+        Finishes feed rendering
+
+        :return:
+            Nothing
+        """
+
+    @abstractmethod
+    def render_exit(self) -> None:
+        """
+        Finishes renderer, should be called at the end of rendering
+
+        :return:
+            Nothing
+        """
+
+
 class FeedMiddleware:
     """
     A class used to abstract feed(s) source with feed processor
@@ -149,6 +214,15 @@ class FeedMiddleware:
     def __init__(
         self, source: FeedSource, cache_writer: Optional[CacheFeedWriter] = None
     ):
+        """
+        Initialize middleware for the feed and constructs all the necessary attributes
+
+        :param source:
+            A source that should be used for fetching feed
+
+        :param cache_writer:
+            An optional cache writer for feed content
+        """
         self._source = source
         self._cache_writer = cache_writer
         self._entry_count = 0
@@ -184,6 +258,31 @@ class FeedMiddleware:
             yield item
             if maximum and self._entry_count >= maximum:
                 return
+
+    def process(
+        self, renderers: Iterable[FeedRenderer], maximum: Optional[int] = None
+    ) -> None:
+        """
+        Process feed by calling renderers for feed header and elements
+
+        :param renderers:
+            Iterable FeedRenderer that should be called during feed processing
+
+        :param maximum:
+            an int that limits processing of feed items
+
+        :return:
+            Nothing
+        """
+        for renderer in renderers:
+            renderer.render_feed_start(self.header)
+
+        for data in self.entries(maximum):
+            for renderer in renderers:
+                renderer.render_feed_entry(data)
+
+        for renderer in renderers:
+            renderer.render_feed_end()
 
     @property
     def processed_entries(self) -> int:
@@ -601,7 +700,7 @@ class FileCacheFeedWriter(FileCacheFeedHelper, CacheFeedWriter):
     A class used to write feed content to file cache
     """
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str):
         """
         Init feed cache for writing
 
@@ -625,23 +724,67 @@ class FileCacheFeedWriter(FileCacheFeedHelper, CacheFeedWriter):
             self._add_entry_to_map(self._feed, data, cache_map_entry)
 
 
+class SimpleHtmlParser(HTMLParser):
+    """
+    A class used to sanitize HTML
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._start_cnt = 0
+        self._end_cnt = 0
+        self._parse_error = False
+
+    @call_logger("tag", "attrs")
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        self._start_cnt += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        self._end_cnt += 1
+
+    @call_logger("message")
+    def error(self, message: str) -> Any:
+        self._parse_error = True
+
+    def convert(self, text: str) -> str:
+        """
+        Prepare HTML/text for publishing inside HTML
+
+        :param text:
+            an input text or HTML
+
+        :return:
+            a string that can be used as a content in HTML
+        """
+        self._parse_error = False
+        self._start_cnt = 0
+        self._end_cnt = 0
+        self.feed(text)
+        self.close()
+        logging.info(
+            "html check: start=%s, end=%s, parse_error=%s",
+            self._start_cnt,
+            self._end_cnt,
+            self._parse_error,
+        )
+        is_html = (
+            not self._parse_error
+            and self._start_cnt
+            and self._end_cnt
+            and self._start_cnt >= self._end_cnt
+        )
+        return text if is_html else html.escape(text)
+
+
 FieldValueProcessor = Callable[[str, str], None]
 
 
-class Renderer(ABC):
-    """
-    An abstract class used for rendering feed
+class ConsoleRenderer(FeedRenderer, ABC):
+    """SimpleHtmlParser
+    An abstract class used for rendering feed for console
     """
 
-    FEED_FIELDS = ("title",)
-    ENTRY_FIELDS = (
-        "title",
-        "published",
-        "link",
-        "description",
-    )
-
-    def __init__(self, body_width: Optional[int] = None) -> None:
+    def __init__(self, body_width: Optional[int] = None):
         self._html = HTML2Text(bodywidth=body_width or sys.maxsize)
         self._html.images_to_alt = True
         self._html.default_image_alt = "image"
@@ -671,32 +814,8 @@ class Renderer(ABC):
     ) -> None:
         self._render_fields(self.ENTRY_FIELDS, data, processor)
 
-    @abstractmethod
-    def render_feed(self, header: FeedData, entries: Iterable[FeedData]) -> None:
-        """
-        Render feed header and entries
 
-        :param header:
-            a dictionary with header elements
-
-        :param entries:
-            an iterable with FeedData for entries
-
-        :return:
-            Nothing
-        """
-
-    @abstractmethod
-    def render_exit(self) -> None:
-        """
-        Finish rendering
-
-        :return:
-            Nothing
-        """
-
-
-class TextRenderer(Renderer):
+class TextRenderer(ConsoleRenderer):
     """
     A class used for rendering feed as a text in console
     """
@@ -712,112 +831,165 @@ class TextRenderer(Renderer):
             "description": "\n{}",
         }
 
-    def render_feed(self, header: FeedData, entries: Iterable[FeedData]) -> None:
+    def render_feed_start(self, header: FeedData) -> None:
         def header_processor(key: str, value: str) -> None:
             print(self._header_formats[key].format(value))
 
+        self._render_header_fields(header, header_processor)
+
+    def render_feed_entry(self, entry: FeedData) -> None:
         def entry_processor(key: str, value: str) -> None:
             print(self._entry_formats[key].format(value))
 
-        self._render_header_fields(header, header_processor)
+        self._render_entry_fields(entry, entry_processor)
 
-        for data in entries:
-            self._render_entry_fields(data, entry_processor)
+    def render_feed_end(self) -> None:
+        pass
 
     def render_exit(self) -> None:
         pass
 
 
-class JsonRenderer(Renderer):
+class JsonRenderer(ConsoleRenderer):
     """
-    A class used for rendering feed as JSON
+    A class used for rendering feed as JSON in console
     """
 
     def __init__(self) -> None:
         super().__init__()
         self._json: list[dict] = []
+        self._feed_json: dict = {}
+        self._feed_entries: list[dict] = []
 
-    def render_feed(self, header: FeedData, entries: Iterable[FeedData]) -> None:
-        feed_json: dict = {}
-        result: dict = {}
-        items = []
+    def render_feed_start(self, header: FeedData) -> None:
+        self._feed_json = {}
 
         def header_processor(key: str, value: str) -> None:
-            feed_json[key] = value
+            self._feed_json[key] = value
+
+        self._render_header_fields(header, header_processor)
+
+        self._feed_entries = []
+
+    def render_feed_entry(self, entry: FeedData) -> None:
+        result: dict = {}
 
         def entry_processor(key: str, value: str) -> None:
             result[key] = value
 
-        self._render_header_fields(header, header_processor)
+        self._render_entry_fields(entry, entry_processor)
 
-        for data in entries:
-            result = {}
-            self._render_entry_fields(data, entry_processor)
-            items.append(result)
+        self._feed_entries.append(result)
 
-        feed_json["entries"] = items
-        self._json.append(feed_json)
+    def render_feed_end(self) -> None:
+        self._feed_json["entries"] = self._feed_entries
+        self._json.append(self._feed_json)
 
     def render_exit(self) -> None:
         print(json.dumps(self._json))
 
 
-def feed_processor(
-    url: Optional[str] = None,
-    limit: Optional[int] = None,
-    is_json: bool = False,
-    date_filter: Optional[date] = None,
-) -> None:
+class FileRenderer(FeedRenderer, ABC):
     """
-    Performs loading and displaying of the RSS feed
+    An abstract class used for rendering feed for file
+    """
 
-    :param url:
-        an address of the RSS feed
+    def __init__(self, file_name: str):
+        self._file = Path(file_name)
 
-    :param limit:
-        an int that limits processing of items in the feed (0 means no limit)
 
-    :param is_json:
-        should data be displayed in JSON format
+class HtmlRenderer(FileRenderer):
+    """
+    A class used to render HTML file
+    """
 
-    :param date_filter:
-        should cache be used to filter by published date
+    STYLES = """
+h2, h3 {
+  text-align: center;
+}
+
+.published {
+  text-align: right;
+}
+"""
+
+    HTML_TEMPLATE = """
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<style>
+{styles}
+</style>
+<title>Feed</title></head><body>{body}</body></html>"""
+
+    def __init__(self, file_name: str):
+        super().__init__(file_name)
+        self._html = self.HTML_TEMPLATE
+        self._parser = SimpleHtmlParser()
+
+    def render_feed_start(self, header: FeedData) -> None:
+        header_html = """<h2>{title}</h2>"""
+        args = {}
+        for field in self.FEED_FIELDS:
+            args[field] = self._parser.convert(header.get(field, ""))
+        header_html = header_html.format(**args)
+
+        self._html = self._html.format(styles="{styles}", body=f"{header_html}{{body}}")
+
+    def render_feed_entry(self, entry: FeedData) -> None:
+        entry_html = """<h3><a href ="{link}">{title}</a></h3>
+        <div class="published">{published}</div><p>{description}</p>"""
+        args = {}
+        for field in self.ENTRY_FIELDS:
+            value = entry.get(field, "")
+            if value and field != "link":
+                value = self._parser.convert(value)
+            args[field] = value
+        entry_html = entry_html.format(**args)
+
+        self._html = self._html.format(styles="{styles}", body=f"{entry_html}{{body}}")
+
+    def render_feed_end(self) -> None:
+        pass
+
+    def render_exit(self) -> None:
+        self._html = self._html.format(styles=self.STYLES, body="")
+        try:
+            with open(self._file, "w", encoding="utf-8") as file:
+                file.write(self._html)
+        except Exception as ex:
+            logging.info("HTML file save failed with '%s'", ex)
+            raise ExportIssue from ex
+
+
+class EpubRenderer(FileRenderer):
+    """
+    A class used to render EPUB file
+    """
+
+    def render_feed_start(self, header: FeedData) -> None:
+        raise NotImplementedError
+
+    def render_feed_entry(self, entry: FeedData) -> None:
+        raise NotImplementedError
+
+    def render_feed_end(self) -> None:
+        raise NotImplementedError
+
+    def render_exit(self) -> None:
+        raise NotImplementedError
+
+
+def parse_arguments() -> Namespace:
+    """
+    Parse CLI arguments
 
     :return:
-        Nothing
-    """
-
-    if limit == 0:
-        limit = None
-
-    if date_filter:
-        feeds = FileCacheFeedHelper().filter_entries(date_filter, url)
-    elif url:
-        feeds = [FeedMiddleware(WebFeedReader(url), FileCacheFeedWriter(url))]
-    else:
-        raise ValueError
-
-    renderer: Renderer = JsonRenderer() if is_json else TextRenderer()
-
-    for feed in feeds:
-        renderer.render_feed(feed.header, feed.entries(limit))
-        if limit:
-            limit -= feed.processed_entries
-        if limit == 0:
-            break
-
-    renderer.render_exit()
-
-
-def main() -> None:  # pylint: disable=too-many-statements
-    """
-    CLI for feed processing
+        Namespace with parsed arguments
     """
 
     def check_non_negative(value: str) -> int:
         result = int(value)
         if result < 0:
-            raise argparse.ArgumentTypeError(f"{value} is not a non-negative int value")
+            raise ArgumentTypeError(f"{value} is not a non-negative int value")
         return result
 
     def check_date(value: str) -> date:
@@ -825,9 +997,9 @@ def main() -> None:  # pylint: disable=too-many-statements
             return datetime.strptime(value, "%Y%m%d").date()
         except ValueError as exc:
             msg = f"{value} is not a date in YYYYMMDD format"
-            raise argparse.ArgumentTypeError(msg) from exc
+            raise ArgumentTypeError(msg) from exc
 
-    parser = argparse.ArgumentParser(description="Pure Python command-line RSS reader.")
+    parser = ArgumentParser(description="Pure Python command-line RSS reader.")
     group = parser.add_argument_group("content")
     group.add_argument("url", nargs="?", type=str, help="RSS URL", metavar="source")
     parser.add_argument("--version", action="version", version=f"Version {__version__}")
@@ -847,6 +1019,17 @@ def main() -> None:  # pylint: disable=too-many-statements
         type=check_non_negative,
         help="Limit news topics if this parameter provided",
     )
+    converter_group = parser.add_mutually_exclusive_group()
+    converter_group.add_argument(
+        "--to-html",
+        help="Converts to HTML file",
+        metavar="FILE_NAME",
+    )
+    converter_group.add_argument(
+        "--to-epub",
+        help="Converts to EPUB file",
+        metavar="FILE_NAME",
+    )
     group.add_argument("--cleanup", action="store_true", help="Clear cached data")
     group.add_argument(
         "--date",
@@ -861,6 +1044,84 @@ def main() -> None:  # pylint: disable=too-many-statements
     if args.cleanup and args.date:
         parser.error("--cleanup cannot be used with --date")
 
+    return args
+
+
+def feed_processor(  # pylint: disable=too-many-arguments
+    url: Optional[str] = None,
+    limit: Optional[int] = None,
+    is_json: bool = False,
+    date_filter: Optional[date] = None,
+    html_file: Optional[str] = None,
+    epub_file: Optional[str] = None,
+) -> None:
+    """
+    Performs loading and displaying of the RSS feed
+
+    :param url:
+        an address of the RSS feed (optional if date_filter is provided)
+
+    :param limit:
+        an int that limits processing of items in the feed (0 means no limit)
+
+    :param is_json:
+        should data be displayed in JSON format (False is default)
+
+    :param date_filter:
+        should cache be used to filter by published date (optional)
+
+    :param html_file:
+        file name for saving in HTML format (optional)
+
+    :param epub_file:
+        file name for saving in EPUB format (optional)
+
+    :return:
+        Nothing
+    """
+
+    limit = None if limit == 0 else limit
+
+    if date_filter:
+        feeds = FileCacheFeedHelper().filter_entries(date_filter, url)
+    elif url:
+        feeds = [FeedMiddleware(WebFeedReader(url), FileCacheFeedWriter(url))]
+    else:
+        raise ValueError("At least url or date_filter is required")
+
+    if html_file and epub_file:
+        raise ValueError("Both html_file and epub_file cannot be set")
+
+    renderers: list[FeedRenderer] = []
+
+    if is_json:
+        renderers.append(JsonRenderer())
+
+    if html_file:
+        renderers.append(HtmlRenderer(html_file))
+    elif epub_file:
+        renderers.append(EpubRenderer(epub_file))
+    elif not is_json:
+        renderers.append(TextRenderer())
+
+    for feed in feeds:
+        feed.process(renderers, limit)
+        if limit:
+            limit -= feed.processed_entries
+            if limit <= 0:
+                break
+
+    for renderer in renderers:
+        renderer.render_exit()
+
+
+def main() -> None:
+    """
+    CLI for feed processing
+    """
+
+    args = parse_arguments()
+
     logging.basicConfig(format="%(asctime)s %(message)s", level=args.log_level)
 
     try:
@@ -868,7 +1129,14 @@ def main() -> None:  # pylint: disable=too-many-statements
         if args.cleanup:
             FileCacheFeedMapper.reset_cache()
         if args.url or args.date:
-            feed_processor(args.url, args.limit, args.json, args.date)
+            feed_processor(
+                args.url,
+                args.limit,
+                args.json,
+                args.date,
+                args.to_html,
+                args.to_epub,
+            )
     except ContentUnreachable:
         print("Error happened as content cannot be loaded from", args.url)
         sys.exit(10)
@@ -876,11 +1144,18 @@ def main() -> None:  # pylint: disable=too-many-statements
         print("Error happened as there is no RSS at", args.url)
         sys.exit(20)
     except CacheEmpty:
-        print("Error happened as there is no data in cache for", args.date)
+        print(
+            "Error happened as there is no data in cache for",
+            args.date,
+            f"and url {args.url}" if args.url else "",
+        )
         sys.exit(30)
     except CacheIssue:
         print("Working with cache failed. Try calling script with --cleanup")
         sys.exit(40)
+    except ExportIssue:
+        print("Cannot export to", args.to_html or args.to_epub)
+        sys.exit(50)
     except Exception as ex:  # pylint: disable=broad-except
         logging.info("Exception was raised '%s'", ex)
         print("Error happened during program execution.")
