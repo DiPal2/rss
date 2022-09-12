@@ -17,22 +17,25 @@ After that you can use `rss_reader` from any folder or `rss_reader.py` located i
 
 ## Usage
 
-`rss_reader.py  [-h] [--version] [--json] [--verbose] [--limit LIMIT] [--cleanup] [--date DATE] [source]`
+`rss_reader.py  [-h] [--version] [--json] [--verbose] [--limit LIMIT] [--to-html FILE_NAME] [--to-epub FILE_NAME] [--cleanup] [--date DATE] [source]`
 
-| Option          | Description                                                        |
-|-----------------|--------------------------------------------------------------------|
-| `-h`, `--help`  | show this help message and exit                                    |
-| `--version`     | show program's version number and exit                             |
-| `--json`        | Print result as JSON in stdout                                     |
-| `--verbose`     | Outputs verbose status messages                                    |
-| `--limit LIMIT` | Limit news topics if this parameter provided                       |
-| `source`        | RSS URL                                                            |
-| `--cleanup`     | Clear cached data                                                  |
-| `--date DATE`   | Limit news to only cached data with such published date (YYYYMMDD) |
+| Option                | Description                                                        |
+|-----------------------|--------------------------------------------------------------------|
+| `-h`, `--help`        | show this help message and exit                                    |
+| `--version`           | show program's version number and exit                             |
+| `--json`              | Print result as JSON in stdout                                     |
+| `--verbose`           | Outputs verbose status messages                                    |
+| `--limit LIMIT`       | Limit news topics if this parameter provided                       |
+| `--to-html FILE_NAME` | Export result to HTML file                                         |
+| `--to-epub FILE_NAME` | Export result to EPUB file                                         |
+| `source`              | RSS URL                                                            |
+| `--cleanup`           | Clear cached data                                                  |
+| `--date DATE`         | Limit news to only cached data with such published date (YYYYMMDD) |
 
 * At least `source` or `--date` or `--cleanup` is required
 * `--limit` affects saving news to cache
 * `DATE` filter is applied for all published news between 00:00:00.000 and 23:59:59.999 in your local time zone
+* If `--to-html` and/or `--to-epub` are given, there will be no console output unless `--json` and/or `--version` is used or execution encounters a problem
 
 ### Example of generated JSON:
 ```json
@@ -90,6 +93,14 @@ rss_reader
 ├── 2                                                      (folder for 2nd loaded feed)
 │   ├── header.bin                                         (dictionary for feed header information)
 │   ├── entries.bin                                        (mapping for feed entry(guid, published_date_with_timezone, file_name_with_entry_dictionary))
+....................
+└── web                                                    (folder for storing web images loaded for EPUB export)
+    ├── 1032                                               (1-4 digits from hashed function appplied on 1st web image URL)
+    │   └── 467                                            (5-7 digits from hashed function appplied on 1st web image URL)
+    │       └── 295                                        (8-10 digits from hashed function appplied on 1st web image URL)
+    │           ├── content.bin                            (mapping for hashed URL (local_file_name, cache_expiration, content_type))
+    │           └── 5d6d77216eb24fc4a606ac6b6d04d592.bin   (content of 1st web image URL)
+    ├── 0435                                               (1-4 digits from hashed function appplied on 2nd web image URL)
 ....................
 ```
 

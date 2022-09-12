@@ -1,29 +1,8 @@
 """tests for FileCacheFeedMapper"""
 
-from pathlib import Path
-import pytest
-
-from rss_reader.rss_reader import FileCacheFeedMapper
-
-
-@pytest.fixture(name="home_path")
-def fixture_home_path(tmp_path):
-    """
-    A fixture for path for storing cache
-    """
-    return tmp_path / "rss_test"
-
-
-@pytest.fixture(name="home")
-def fixture_home(monkeypatch, home_path):
-    """
-    A fixture for Path.home()
-    """
-
-    def mock_return():
-        return home_path
-
-    monkeypatch.setattr(Path, "home", mock_return)
+from rss_reader.rss_reader import AppFileCache, FileCacheFeedMapper
+from tests.helpers import fixture_home  # pylint: disable=unused-import
+from tests.helpers import fixture_home_path  # pylint: disable=unused-import
 
 
 def test_file_cache_feed_mapper(home, home_path):  # pylint: disable=unused-argument
@@ -32,18 +11,16 @@ def test_file_cache_feed_mapper(home, home_path):  # pylint: disable=unused-argu
     """
     url = "any url that you want"
 
-    mapper = FileCacheFeedMapper()
-
-    feed_path = mapper.feed_to_path(url)
+    feed_path = FileCacheFeedMapper.feed_to_path(url)
 
     assert str(feed_path).startswith(str(home_path))
 
-    all_mapping = mapper.get_map()
+    all_mapping = FileCacheFeedMapper.get_map()
 
     assert str(all_mapping[url]).startswith(str(home_path))
 
-    mapper.reset_cache()
+    AppFileCache.reset_cache()
 
-    all_mapping = mapper.get_map()
+    all_mapping = FileCacheFeedMapper.get_map()
 
     assert all_mapping == {}

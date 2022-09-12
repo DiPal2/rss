@@ -1,11 +1,13 @@
 """Reads RSS feed and displays it in various formats"""
+# pylint: disable=too-many-lines
 
 from abc import ABC, abstractmethod
-import argparse
+from argparse import ArgumentParser, ArgumentTypeError, Namespace
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager
 from datetime import date, datetime, time, timedelta, timezone
-from functools import wraps
+from functools import wraps, lru_cache
 import inspect
 import json
 import logging
@@ -15,13 +17,16 @@ import shutil
 import sys
 from typing import Any, BinaryIO, Optional
 import uuid
-import xml.etree.ElementTree as ET
+from xml.etree import ElementTree
+import zlib
 
+from bs4 import BeautifulSoup
 import dateparser
+from ebooklib import epub
 from html2text import HTML2Text
 import requests
 
-__version_info__ = ("0", "3", "2")
+__version_info__ = ("0", "4", "1")
 __version__ = ".".join(__version_info__)
 
 
@@ -84,6 +89,18 @@ class CacheIssue(RssReaderError):
     """
 
 
+class HtmlExportIssue(RssReaderError):
+    """
+    HTML export failure exception
+    """
+
+
+class EpubExportIssue(RssReaderError):
+    """
+    EPUB export failure exception
+    """
+
+
 FeedData = dict[str, str]
 
 
@@ -119,7 +136,7 @@ class CacheFeedWriter(ABC):
 
 class FeedSource(ABC):
     """
-    An abstract class for a feed source
+    An abstract class for reading feed from a source
     """
 
     @abstractmethod
@@ -141,41 +158,90 @@ class FeedSource(ABC):
         """
 
 
+class FeedRenderer(ABC):
+    """
+    An abstract class used for rendering feed
+    """
+
+    FEED_FIELDS = ("title",)
+    ENTRY_FIELDS = (
+        "title",
+        "published",
+        "link",
+        "description",
+    )
+
+    @abstractmethod
+    def render_feed_start(self, header: FeedData) -> None:
+        """
+        Starts feed rendering with header data
+
+        :param header:
+            FeedData with header elements
+
+        :return:
+            Nothing
+        """
+
+    @abstractmethod
+    def render_feed_entry(self, entry: FeedData) -> None:
+        """
+        Render feed entry
+
+        :param entry:
+            FeedData with entry elements
+
+        :return:
+            Nothing
+        """
+
+    @abstractmethod
+    def render_feed_end(self) -> None:
+        """
+        Finishes feed rendering
+
+        :return:
+            Nothing
+        """
+
+    @abstractmethod
+    def render_exit(self) -> None:
+        """
+        Finishes renderer, should be called at the end of rendering
+
+        :return:
+            Nothing
+        """
+
+
 class FeedMiddleware:
     """
-    A class used to abstract feed(s) source with feed processor
+    A class used to call renders and cache writer for one feed source
     """
 
     def __init__(
         self, source: FeedSource, cache_writer: Optional[CacheFeedWriter] = None
     ):
+        """
+        Initialize middleware for the feed and constructs all the necessary attributes
+
+        :param source:
+            A source that should be used for fetching feed
+
+        :param cache_writer:
+            An optional cache writer for feed content
+        """
         self._source = source
         self._cache_writer = cache_writer
         self._entry_count = 0
 
-    @property
-    def header(self) -> FeedData:
-        """
-        Returns feed header
-
-        :return:
-            A FeedData for header
-        """
+    def _header(self) -> FeedData:
         header = self._source.read_header()
         if self._cache_writer:
             self._cache_writer.write_header(header)
         return header
 
-    def entries(self, maximum: Optional[int] = None) -> Iterable[FeedData]:
-        """
-        Returns feed entries as an Iterable
-
-        :param maximum:
-            an int that limits processing of feed items
-
-        :return:
-            An Iterable of FeedData entries
-        """
+    def _entries(self, maximum: Optional[int] = None) -> Iterable[FeedData]:
         self._entry_count = 0
         for item in self._source.entry_iter():
             if self._cache_writer:
@@ -184,6 +250,31 @@ class FeedMiddleware:
             yield item
             if maximum and self._entry_count >= maximum:
                 return
+
+    def process(
+        self, renderers: Iterable[FeedRenderer], maximum: Optional[int] = None
+    ) -> None:
+        """
+        Process feed by calling renderers for feed header and elements
+
+        :param renderers:
+            Iterable FeedRenderer that should be called during feed processing
+
+        :param maximum:
+            an int that limits processing of feed items
+
+        :return:
+            Nothing
+        """
+        for renderer in renderers:
+            renderer.render_feed_start(self._header())
+
+        for data in self._entries(maximum):
+            for renderer in renderers:
+                renderer.render_feed_entry(data)
+
+        for renderer in renderers:
+            renderer.render_feed_end()
 
     @property
     def processed_entries(self) -> int:
@@ -218,7 +309,7 @@ class StringFeedReader(FeedSource):
 
         logging.info("StringFeedReader started")
         try:
-            root = ET.fromstring(content)
+            root = ElementTree.fromstring(content)
         except Exception as ex:
             logging.info("XML parsing failed with '%s'", ex)
             raise NotRssContent from ex
@@ -230,7 +321,7 @@ class StringFeedReader(FeedSource):
             raise NotRssContent
 
     def _xml_children_to_dict(
-        self, xml_element: ET.Element, stop_element_name: Optional[str] = None
+        self, xml_element: ElementTree.Element, stop_element_name: Optional[str] = None
     ) -> FeedData:
         result: FeedData = {}
         for child in xml_element:
@@ -272,6 +363,8 @@ class WebFeedReader(StringFeedReader):  # pylint: disable=too-few-public-methods
         except Exception as ex:
             logging.info("WebFeedReader failed with '%s'", ex)
             raise ContentUnreachable from ex
+        if request.status_code != requests.codes.ok:  # pylint: disable=no-member
+            raise ContentUnreachable
         super().__init__(request.text)
 
 
@@ -311,16 +404,16 @@ class FileCache(AbstractContextManager):
         """
         logging.info("FileCache load called for %s", self._file_name)
         try:
-            if self._file_name.stat().st_size == 0:
-                data = {}
-            else:
-                data = pickle.load(self._file)
+            data = (
+                {} if self._file_name.stat().st_size == 0 else pickle.load(self._file)
+            )
         except Exception as ex:
             logging.info("FileCache for %s cannot be loaded: %s", self._file_name, ex)
             raise CacheIssue from ex
         if not isinstance(data, dict):
             logging.info("FileCache for %s loaded garbage", self._file_name)
             raise CacheIssue
+        logging.info("FileCache loaded data for %s", self._file_name)
         return data
 
     def save(self, data: dict) -> None:
@@ -350,21 +443,21 @@ class FileCacheFeedReader(FeedSource):
     A class used to read a feed from file cache
     """
 
-    def __init__(self, header_file: Path, entries: list[Path]):
+    def __init__(self, header: Path, entries: list[Path]):
         """
         Init feed reading from a file cache and constructs all the necessary attributes
 
-        :param header_file:
-            a Path to header file
+        :param header:
+            a Path to file cache for header
 
         :param entries:
-            a list of Paths to entries files
+            a list of Paths to file cache for entries
         """
-        self._header_file = header_file
+        self._header = header
         self._entries = entries
 
     def read_header(self) -> FeedData:
-        with FileCache(self._header_file) as cache:
+        with FileCache(self._header) as cache:
             result: FeedData = cache.load()
         return result
 
@@ -375,20 +468,16 @@ class FileCacheFeedReader(FeedSource):
                 yield result
 
 
-class FileCacheFeedMapper:
+class AppFileCache:
     """
-    A class used to map a feed to a cache folder
+    A class used to cache application specific data using files
     """
-
-    def __init__(self) -> None:
-        self._folder = self.cache_folder()
-        logging.info("Cache folder %s", self._folder)
-        self._map_file = self._folder / "feeds.bin"
 
     @staticmethod
+    @lru_cache(1)
     def cache_folder() -> Path:
         """
-        Get cache folder location
+        Get app cache folder location
 
         :return:
             Path
@@ -400,7 +489,10 @@ class FileCacheFeedMapper:
             cache_dir = home / "Library" / "Application Support"
         else:
             cache_dir = home / ".local" / "share"
-        return cache_dir / "rss_reader"
+
+        app_cache_dir = cache_dir / "rss_reader"
+        logging.info("Cache folder %s", app_cache_dir)
+        return app_cache_dir
 
     @staticmethod
     def reset_cache() -> None:
@@ -410,7 +502,7 @@ class FileCacheFeedMapper:
         :return:
             Nothing
         """
-        FileCacheFeedMapper._rmdir(FileCacheFeedMapper.cache_folder())
+        AppFileCache._rmdir(AppFileCache.cache_folder())
         print("Cache was erased successfully")
 
     @staticmethod
@@ -422,14 +514,31 @@ class FileCacheFeedMapper:
                 if item.is_file() or item.is_symlink():
                     item.unlink(missing_ok=True)
                 elif item.is_dir():
-                    FileCacheFeedMapper._rmdir(item)
+                    AppFileCache._rmdir(item)
             folder.rmdir()
             logging.info("Removed empty folder %s", folder)
         except Exception as ex:
             logging.info("_rmdir %s failed with '%s'", folder, ex)
             raise CacheIssue from ex
 
-    def feed_to_path(self, url: str) -> Path:
+
+class FileCacheFeedMapper:
+    """
+    A class used to map a feed to a cache folder
+    """
+
+    @staticmethod
+    @lru_cache(1)
+    def _cache_folder() -> Path:
+        return AppFileCache.cache_folder()
+
+    @staticmethod
+    @lru_cache(1)
+    def _map_file() -> Path:
+        return FileCacheFeedMapper._cache_folder() / "feeds.bin"
+
+    @staticmethod
+    def feed_to_path(url: str) -> Path:
         """
         Converts a feed url to an appropriate cache folder
 
@@ -439,7 +548,7 @@ class FileCacheFeedMapper:
         :return:
             a Path to a cache folder
         """
-        with FileCache(self._map_file) as cache:
+        with FileCache(FileCacheFeedMapper._map_file()) as cache:
             mapper = cache.load()
             current = mapper.get(url)
             if not current:
@@ -448,20 +557,24 @@ class FileCacheFeedMapper:
                 mapper[url] = current
                 cache.save(mapper)
 
-        feed_path: Path = self._folder / str(current)
+        feed_path: Path = FileCacheFeedMapper._cache_folder() / str(current)
         logging.info("Using url %s with cache: %s", url, feed_path)
         return feed_path
 
-    def get_map(self) -> dict[str, Path]:
+    @staticmethod
+    def get_map() -> dict[str, Path]:
         """
         Returns full map between feed urls and cache folders
 
         :return:
             a dictionary of urls with feed cache Path
         """
-        with FileCache(self._map_file) as cache:
+        with FileCache(FileCacheFeedMapper._map_file()) as cache:
             mapper = cache.load()
-        return {key: self._folder / str(value) for key, value in mapper.items()}
+        return {
+            key: FileCacheFeedMapper._cache_folder() / str(value)
+            for key, value in mapper.items()
+        }
 
 
 class FileCacheFeedHelper:
@@ -490,7 +603,7 @@ class FileCacheFeedHelper:
     def _entry_datetime(map_entry: FileCacheMapEntry) -> Optional[datetime]:
         return map_entry[1]
 
-    def _filter_feed_entries(self, feed: Path, date_filter: date) -> list[Path]:
+    def _filter_entries_in_feed(self, feed: Path, date_filter: date) -> list[Path]:
         mapper = self._load_map_of_entries(feed)
         local_tz = datetime.now(timezone.utc).astimezone().tzinfo
         date_from = datetime.combine(date_filter, time.min, local_tz)
@@ -521,13 +634,13 @@ class FileCacheFeedHelper:
             raised when there is no filtered data
         """
         filtered = []
-        feeds = FileCacheFeedMapper().get_map()
+        feeds = FileCacheFeedMapper.get_map()
 
         if url:
             feeds = {url: feeds[url]} if url in feeds else {}
 
         for feed_path in feeds.values():
-            if entries := self._filter_feed_entries(feed_path, date_filter):
+            if entries := self._filter_entries_in_feed(feed_path, date_filter):
                 feed_reader = FileCacheFeedReader(feed_path / self.HEADER_FILE, entries)
                 filtered.append(FeedMiddleware(feed_reader))
 
@@ -542,7 +655,7 @@ class FileCacheFeedHelper:
             entries_map: dict = cache.load()
         return entries_map
 
-    def _is_good_entry_in_map(self, feed_path: Path, data: FeedData) -> bool:
+    def _is_entry_in_map_good(self, feed_path: Path, data: FeedData) -> bool:
         if self.GUID_FIELD not in data:
             return False
         guid = data[self.GUID_FIELD]
@@ -601,7 +714,7 @@ class FileCacheFeedWriter(FileCacheFeedHelper, CacheFeedWriter):
     A class used to write feed content to file cache
     """
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str):
         """
         Init feed cache for writing
 
@@ -609,14 +722,14 @@ class FileCacheFeedWriter(FileCacheFeedHelper, CacheFeedWriter):
             an address of a feed
         """
         super().__init__()
-        self._feed = FileCacheFeedMapper().feed_to_path(url)
+        self._feed = FileCacheFeedMapper.feed_to_path(url)
 
     def write_header(self, data: FeedData) -> None:
         with FileCache(self._feed / self.HEADER_FILE) as cache:
             cache.save(data)
 
     def write_entry(self, data: FeedData) -> None:
-        if self._is_good_entry_in_map(self._feed, data):
+        if self._is_entry_in_map_good(self._feed, data):
             return
         if cache_map_entry := self.new_cache_map_entry(data):
             full_name = self._entry_full_path(self._feed, cache_map_entry)
@@ -625,25 +738,174 @@ class FileCacheFeedWriter(FileCacheFeedHelper, CacheFeedWriter):
             self._add_entry_to_map(self._feed, data, cache_map_entry)
 
 
+class WebFileCacheMapRow:
+    """
+    A class used to represent a row in a map file for web file cache
+    """
+
+    def __init__(self, file_name: str, expiration: datetime, content_type: str) -> None:
+        self._file_name = file_name
+        self._expiration = expiration
+        self._content_type = content_type
+
+    def __repr__(self) -> str:
+        attributes = f"{self._file_name}, {self._expiration}, {self._content_type}"
+        return f"WebFileCacheMapRow({attributes})"
+
+    @property
+    def file_name(self) -> str:
+        """
+        Local file name
+
+        :return:
+            string
+        """
+        return self._file_name
+
+    @property
+    def expiration(self) -> datetime:
+        """
+        Expiration datetime of cached file
+
+        :return:
+            datetime
+        """
+        return self._expiration
+
+    @property
+    def content_type(self) -> str:
+        """
+        Content type of cached file
+
+        :return:
+            string
+        """
+        return self._content_type
+
+
+class SafeWebFileCache:  # pylint: disable=too-few-public-methods
+    """
+    A class used to cache content from web
+    """
+
+    @staticmethod
+    @lru_cache(1)
+    def _cache_folder() -> Path:
+        return AppFileCache.cache_folder() / "web"
+
+    @staticmethod
+    def _map_file_name() -> str:
+        return "content.bin"
+
+    @staticmethod
+    @lru_cache(1)
+    def _url_to_cache_path(url: str) -> Path:
+        hashed = f"{zlib.adler32(str.encode(url)):010}"
+        path = SafeWebFileCache._cache_folder() / hashed[:4] / hashed[4:7] / hashed[7:]
+        logging.info("%s hash folder: %s", url, path)
+        return path
+
+    @staticmethod
+    @call_logger("cache_path")
+    def _get_hash_map(cache_path: Path) -> dict[str, WebFileCacheMapRow]:
+        cache_map_file = cache_path / SafeWebFileCache._map_file_name()
+        with FileCache(cache_map_file) as cache:
+            return cache.load()
+
+    @staticmethod
+    @call_logger("cache_info", "content_type")
+    def _new_hash_map_row(cache_info: str, content_type: str) -> WebFileCacheMapRow:
+        parsed: dict[str, Optional[int]] = {"max-age": None, "s-maxage": None}
+        for cmd in cache_info.split(","):
+            cmd = cmd.strip()
+            parts = cmd.split("=", 1)
+            key = parts[0].strip()
+            if key in parsed:
+                try:
+                    parsed[key] = int(parts[1].strip())
+                except ValueError:
+                    logging.info("Cache info failed to parse %s", cmd)
+
+        file_name = f"{uuid.uuid4().hex}.bin"
+        expiration_date_time = datetime.now(timezone.utc)
+        if max_age := parsed["s-maxage"] or parsed["max-age"]:
+            expiration_date_time += timedelta(seconds=max_age)
+
+        return WebFileCacheMapRow(file_name, expiration_date_time, content_type)
+
+    @staticmethod
+    @call_logger("url", "cache_map_row")
+    def _add_row_to_hash_map(url: str, cache_map_row: WebFileCacheMapRow) -> None:
+        cache_path = SafeWebFileCache._url_to_cache_path(url)
+        with FileCache(cache_path / SafeWebFileCache._map_file_name()) as cache:
+            mapper = cache.load()
+            mapper[url] = cache_map_row
+            cache.save(mapper)
+
+    @staticmethod
+    def load_url(url: str, is_cache_only: bool) -> tuple[bytes, str]:
+        """
+        Loads content from URL or local file cache
+
+        :param url:
+            an address
+
+        :param is_cache_only:
+            whether to download from web if there is no local cache
+
+        :return:
+            a tuple of content and content type
+        """
+        try:
+            url_cache_path = SafeWebFileCache._url_to_cache_path(url)
+            cache_map = SafeWebFileCache._get_hash_map(url_cache_path)
+            if cache_row := cache_map.get(url):
+                logging.info("SafeWebFileCache found %s for %s", cache_row, url)
+                if is_cache_only or datetime.now(timezone.utc) < cache_row.expiration:
+                    f_name = url_cache_path / cache_row.file_name
+                    logging.info("SafeWebFileCache is loading %s", f_name)
+                    with open(f_name, "rb") as file:
+                        return file.read(), cache_row.content_type
+
+        except Exception as ex:  # pylint: disable=broad-except
+            logging.info("%s cache load exception: %s", url, ex)
+
+        if is_cache_only:
+            return b"", ""
+
+        try:
+            logging.info("%s load attempt", url)
+            resp = requests.get(url, timeout=600)
+            logging.info("%s request status code %s", url, resp.status_code)
+            if resp.status_code == requests.codes.ok:  # pylint: disable=no-member
+                content = resp.content
+                headers = resp.headers
+                c_ctrl = headers.get("cache-control", headers.get("Cache-Control", ""))
+                cnt_type = headers.get("content-type", headers.get("Content-Type", ""))
+                new_row = SafeWebFileCache._new_hash_map_row(c_ctrl, cnt_type)
+                SafeWebFileCache._add_row_to_hash_map(url, new_row)
+                f_name = SafeWebFileCache._url_to_cache_path(url) / new_row.file_name
+                logging.info("SafeWebFileCache is saving to %s", f_name)
+                with open(f_name, "wb") as file:
+                    file.write(content)
+                return content, cnt_type
+        except Exception as ex:  # pylint: disable=broad-except
+            logging.info("%s web load exception: %s", url, ex)
+            raise
+
+        return b"", ""
+
+
 FieldValueProcessor = Callable[[str, str], None]
 
 
-class Renderer(ABC):
+class ConsoleRenderer(FeedRenderer, ABC):
     """
-    An abstract class used for rendering feed
+    An abstract class used for rendering feed for console
     """
 
-    FEED_FIELDS = ("title",)
-    ENTRY_FIELDS = (
-        "title",
-        "published",
-        "link",
-        "description",
-    )
-
-    def __init__(self, body_width: Optional[int] = None) -> None:
+    def __init__(self, body_width: Optional[int] = None):
         self._html = HTML2Text(bodywidth=body_width or sys.maxsize)
-        self._html.images_to_alt = True
         self._html.default_image_alt = "image"
         self._html.single_line_break = True
         sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
@@ -671,32 +933,8 @@ class Renderer(ABC):
     ) -> None:
         self._render_fields(self.ENTRY_FIELDS, data, processor)
 
-    @abstractmethod
-    def render_feed(self, header: FeedData, entries: Iterable[FeedData]) -> None:
-        """
-        Render feed header and entries
 
-        :param header:
-            a dictionary with header elements
-
-        :param entries:
-            an iterable with FeedData for entries
-
-        :return:
-            Nothing
-        """
-
-    @abstractmethod
-    def render_exit(self) -> None:
-        """
-        Finish rendering
-
-        :return:
-            Nothing
-        """
-
-
-class TextRenderer(Renderer):
+class TextRenderer(ConsoleRenderer):
     """
     A class used for rendering feed as a text in console
     """
@@ -712,112 +950,282 @@ class TextRenderer(Renderer):
             "description": "\n{}",
         }
 
-    def render_feed(self, header: FeedData, entries: Iterable[FeedData]) -> None:
+    def render_feed_start(self, header: FeedData) -> None:
         def header_processor(key: str, value: str) -> None:
             print(self._header_formats[key].format(value))
 
+        self._render_header_fields(header, header_processor)
+
+    def render_feed_entry(self, entry: FeedData) -> None:
         def entry_processor(key: str, value: str) -> None:
             print(self._entry_formats[key].format(value))
 
-        self._render_header_fields(header, header_processor)
+        self._render_entry_fields(entry, entry_processor)
 
-        for data in entries:
-            self._render_entry_fields(data, entry_processor)
+    def render_feed_end(self) -> None:
+        pass
 
     def render_exit(self) -> None:
         pass
 
 
-class JsonRenderer(Renderer):
+class JsonRenderer(ConsoleRenderer):
     """
-    A class used for rendering feed as JSON
+    A class used for rendering feed as JSON in console
     """
 
     def __init__(self) -> None:
         super().__init__()
         self._json: list[dict] = []
+        self._feed_json: dict = {}
+        self._feed_entries: list[dict] = []
 
-    def render_feed(self, header: FeedData, entries: Iterable[FeedData]) -> None:
-        feed_json: dict = {}
-        result: dict = {}
-        items = []
+    def render_feed_start(self, header: FeedData) -> None:
+        self._feed_json = {}
 
         def header_processor(key: str, value: str) -> None:
-            feed_json[key] = value
+            self._feed_json[key] = value
+
+        self._render_header_fields(header, header_processor)
+
+        self._feed_entries = []
+
+    def render_feed_entry(self, entry: FeedData) -> None:
+        result: dict = {}
 
         def entry_processor(key: str, value: str) -> None:
             result[key] = value
 
-        self._render_header_fields(header, header_processor)
+        self._render_entry_fields(entry, entry_processor)
 
-        for data in entries:
-            result = {}
-            self._render_entry_fields(data, entry_processor)
-            items.append(result)
+        if result:
+            self._feed_entries.append(result)
 
-        feed_json["entries"] = items
-        self._json.append(feed_json)
+    def render_feed_end(self) -> None:
+        self._feed_json["entries"] = self._feed_entries
+        self._json.append(self._feed_json)
 
     def render_exit(self) -> None:
         print(json.dumps(self._json))
 
 
-def feed_processor(
-    url: Optional[str] = None,
-    limit: Optional[int] = None,
-    is_json: bool = False,
-    date_filter: Optional[date] = None,
-) -> None:
+SoupProcessor = Callable[[BeautifulSoup], None]
+
+
+class HyperTextRenderer(FeedRenderer, ABC):
     """
-    Performs loading and displaying of the RSS feed
+    An abstract class used for rendering feed in HyperText for file
+    """
 
-    :param url:
-        an address of the RSS feed
+    STYLES = "h2,h3{text-align:center}.published{text-align:right;font-style:italic}"
 
-    :param limit:
-        an int that limits processing of items in the feed (0 means no limit)
+    HEADER_TEMPLATE = "<h2>{title}</h2>"
 
-    :param is_json:
-        should data be displayed in JSON format
+    ENTRY_NO_LINK_TEMPLATE = """<h3>{title}</h3><div class="published">{published}</div>
+    <div>{description}</div>"""
 
-    :param date_filter:
-        should cache be used to filter by published date
+    ENTRY_LINK_TEMPLATE = """<h3><a href="{link}" target="_blank">{title}</a></h3>
+    <div class="published">{published}</div><div>{description}</div>"""
+
+    def __init__(self, file_name: str):
+        self._file = Path(file_name)
+
+    @staticmethod
+    def _is_url(data: str) -> bool:
+        return data.startswith("http:") or data.startswith("https:")
+
+    @staticmethod
+    def _is_file_like(data: str) -> bool:
+        extensions = [".html", ".htm", ".xml", ".xhtml", ".txt"]
+        return (
+            "/" in data
+            or "\\" in data
+            or any(data.lower().endswith(ext) for ext in extensions)
+        )
+
+    @staticmethod
+    def _to_html_ready(
+        data: str, soup_processor: Optional[SoupProcessor] = None
+    ) -> str:
+        if len(data) <= 256 and "<" not in data:
+            if HyperTextRenderer._is_url(data) or HyperTextRenderer._is_file_like(data):
+                return data  # BeautifulSoup is not happy with such data
+        soup = BeautifulSoup(data, "html.parser")
+        if soup_processor:
+            soup_processor(soup)
+        return soup.prettify(encoding=None)  # type: ignore[no-any-return]
+
+    @call_logger("header")
+    def _header_to_html(self, header: FeedData) -> tuple[str, dict[str, str]]:
+        args = {
+            field: self._to_html_ready(header.get(field, ""))
+            for field in self.FEED_FIELDS
+        }
+        return self.HEADER_TEMPLATE.format(**args), args
+
+    @call_logger("entry")
+    def _entry_to_html(
+        self, entry: FeedData, soup_processor: Optional[SoupProcessor] = None
+    ) -> str:
+        args = {
+            field: self._to_html_ready(entry.get(field, ""), soup_processor)
+            for field in self.ENTRY_FIELDS
+        }
+        return (
+            self.ENTRY_LINK_TEMPLATE.format(**args)
+            if self._is_url(args["link"])
+            else self.ENTRY_NO_LINK_TEMPLATE.format(**args)
+        )
+
+
+class HtmlRenderer(HyperTextRenderer):
+    """
+    A class used to render HTML file
+    """
+
+    HTML_TEMPLATE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+    <style>{styles}</style><title>Feed</title></head><body>{body}</body></html>"""
+
+    def __init__(self, file_name: str):
+        super().__init__(file_name)
+        self._current_html = ""
+
+    def render_feed_start(self, header: FeedData) -> None:
+        self._current_html += self._header_to_html(header)[0]
+
+    def render_feed_entry(self, entry: FeedData) -> None:
+        self._current_html += self._entry_to_html(entry)
+
+    def render_feed_end(self) -> None:
+        pass
+
+    def render_exit(self) -> None:
+        result = self.HTML_TEMPLATE.format(styles=self.STYLES, body=self._current_html)
+        try:
+            with open(self._file, "w", encoding="utf-8") as file:
+                file.write(result)
+        except Exception as ex:
+            logging.info("HTML file save failed with '%s'", ex)
+            raise HtmlExportIssue from ex
+
+
+class EpubRenderer(HyperTextRenderer):  # pylint: disable=too-many-instance-attributes
+    """
+    A class used to render EPUB file
+    """
+
+    LOADING_THREAD_COUNT = 10
+
+    def __init__(self, file_name: str, is_cache_only: bool):
+        """
+        Init attributes for EPUB rendering
+
+        :param file_name:
+            a name of the file to be written
+
+        :param is_cache_only:
+            whether to use external content from local cache only
+        """
+        super().__init__(file_name)
+        self._book = epub.EpubBook()
+        self._book.set_title("Feeds")
+        self._book.set_language("en")
+        self._book_styles = epub.EpubItem(
+            "styles_main", "style/main.css", "text/css", self.STYLES
+        )
+        self._book.add_item(self._book_styles)
+        self._is_cache_only = is_cache_only
+        self._current_html = ""
+        self._feed_title = ""
+        self._feed_cnt = 0
+        self._images_to_load: dict[str, str] = {}
+        self._feeds: list[epub.EpubHtml] = []
+
+    def _img_processor(self, soup: BeautifulSoup) -> None:
+        found = soup.img
+        while found:
+            if link := found.get("src"):
+                if link not in self._images_to_load:
+                    img_num = len(self._images_to_load) + 1
+                    _, _, img_ext = link.rpartition(".")
+                    epub_file_name = f"images/{self._feed_cnt}/{img_num}.{img_ext}"
+                    found["src"] = epub_file_name
+                    self._images_to_load[link] = epub_file_name
+
+            found = found.find_next("img")
+
+    @staticmethod
+    def _add_epub_image(
+        url: str, is_cache_only: bool, epub_file_name: str
+    ) -> epub.EpubItem:
+        content, content_type = SafeWebFileCache.load_url(url, is_cache_only)
+        uid = epub_file_name.replace("/", "").replace(".", "")
+        return epub.EpubItem(uid, epub_file_name, content_type, content)
+
+    def _add_local_images(self) -> None:
+        with ThreadPoolExecutor(max_workers=self.LOADING_THREAD_COUNT) as executor:
+            results = [
+                executor.submit(
+                    self._add_epub_image, url, self._is_cache_only, epub_file_name
+                )
+                for url, epub_file_name in self._images_to_load.items()
+            ]
+            wait(results)
+
+        for result in results:
+            self._book.add_item(result.result())
+
+    def render_feed_start(self, header: FeedData) -> None:
+        self._feed_cnt += 1
+        self._current_html, converted_data = self._header_to_html(header)
+        self._feed_title = converted_data.get("title", "")
+
+    def render_feed_entry(self, entry: FeedData) -> None:
+        self._current_html += self._entry_to_html(entry, self._img_processor)
+
+    def render_feed_end(self) -> None:
+        uid = f"feed_{self._feed_cnt}"
+        chapter = epub.EpubHtml(
+            uid=uid,
+            file_name=f"{uid}.xhtml",
+            media_type="application/xhtml+xml",
+            content=self._current_html,
+            title=self._feed_title,
+            lang="en",
+        )
+        chapter.add_item(self._book_styles)
+        self._book.add_item(chapter)
+        self._feeds.append(chapter)
+
+    def render_exit(self) -> None:
+        if self._images_to_load:
+            self._add_local_images()
+
+        self._book.toc = tuple(self._feeds)
+        self._book.add_item(epub.EpubNcx())
+        self._book.add_item(epub.EpubNav())
+        self._book.spine = ["nav"] + self._feeds
+        try:
+            epub.write_epub(self._file, self._book)
+        except Exception as ex:
+            logging.info("EPUB file save failed with '%s'", ex)
+            raise EpubExportIssue from ex
+        if not self._file.is_file():
+            raise EpubExportIssue
+
+
+def parse_arguments() -> Namespace:
+    """
+    Parse CLI arguments
 
     :return:
-        Nothing
-    """
-
-    if limit == 0:
-        limit = None
-
-    if date_filter:
-        feeds = FileCacheFeedHelper().filter_entries(date_filter, url)
-    elif url:
-        feeds = [FeedMiddleware(WebFeedReader(url), FileCacheFeedWriter(url))]
-    else:
-        raise ValueError
-
-    renderer: Renderer = JsonRenderer() if is_json else TextRenderer()
-
-    for feed in feeds:
-        renderer.render_feed(feed.header, feed.entries(limit))
-        if limit:
-            limit -= feed.processed_entries
-        if limit == 0:
-            break
-
-    renderer.render_exit()
-
-
-def main() -> None:  # pylint: disable=too-many-statements
-    """
-    CLI for feed processing
+        Namespace with parsed arguments
     """
 
     def check_non_negative(value: str) -> int:
         result = int(value)
         if result < 0:
-            raise argparse.ArgumentTypeError(f"{value} is not a non-negative int value")
+            raise ArgumentTypeError(f"{value} is not a non-negative int value")
         return result
 
     def check_date(value: str) -> date:
@@ -825,9 +1233,9 @@ def main() -> None:  # pylint: disable=too-many-statements
             return datetime.strptime(value, "%Y%m%d").date()
         except ValueError as exc:
             msg = f"{value} is not a date in YYYYMMDD format"
-            raise argparse.ArgumentTypeError(msg) from exc
+            raise ArgumentTypeError(msg) from exc
 
-    parser = argparse.ArgumentParser(description="Pure Python command-line RSS reader.")
+    parser = ArgumentParser(description="Pure Python command-line RSS reader.")
     group = parser.add_argument_group("content")
     group.add_argument("url", nargs="?", type=str, help="RSS URL", metavar="source")
     parser.add_argument("--version", action="version", version=f"Version {__version__}")
@@ -847,6 +1255,16 @@ def main() -> None:  # pylint: disable=too-many-statements
         type=check_non_negative,
         help="Limit news topics if this parameter provided",
     )
+    parser.add_argument(
+        "--to-html",
+        help="Converts to HTML file",
+        metavar="FILE_NAME",
+    )
+    parser.add_argument(
+        "--to-epub",
+        help="Converts to EPUB file",
+        metavar="FILE_NAME",
+    )
     group.add_argument("--cleanup", action="store_true", help="Clear cached data")
     group.add_argument(
         "--date",
@@ -861,14 +1279,100 @@ def main() -> None:  # pylint: disable=too-many-statements
     if args.cleanup and args.date:
         parser.error("--cleanup cannot be used with --date")
 
+    return args
+
+
+def feed_processor(  # pylint: disable=too-many-arguments
+    url: Optional[str] = None,
+    limit: Optional[int] = None,
+    is_json: bool = False,
+    date_filter: Optional[date] = None,
+    html_file: Optional[str] = None,
+    epub_file: Optional[str] = None,
+) -> None:
+    """
+    Performs loading and displaying of the RSS feed
+
+    :param url:
+        an address of the RSS feed (optional if date_filter is provided)
+
+    :param limit:
+        an int that limits processing of items in the feed (0 means no limit)
+
+    :param is_json:
+        whether the data should be displayed in JSON format (False is default)
+
+    :param date_filter:
+        should cache be used to filter by published date (optional)
+
+    :param html_file:
+        file name for saving in HTML format (optional)
+
+    :param epub_file:
+        file name for saving in EPUB format (optional)
+
+    :return:
+        Nothing
+    """
+
+    limit = None if limit == 0 else limit
+    only_local_cache = False
+
+    if date_filter:
+        feeds = FileCacheFeedHelper().filter_entries(date_filter, url)
+        only_local_cache = True
+    elif url:
+        feeds = [FeedMiddleware(WebFeedReader(url), FileCacheFeedWriter(url))]
+    else:
+        raise ValueError("At least url or date_filter is required")
+
+    renderers: list[FeedRenderer] = []
+
+    if is_json:
+        renderers.append(JsonRenderer())
+
+    if html_file:
+        renderers.append(HtmlRenderer(html_file))
+
+    if epub_file:
+        renderers.append(EpubRenderer(epub_file, only_local_cache))
+
+    if not (is_json or html_file or epub_file):
+        renderers.append(TextRenderer())
+
+    for feed in feeds:
+        feed.process(renderers, limit)
+        if limit:
+            limit -= feed.processed_entries
+            if limit <= 0:
+                break
+
+    for renderer in renderers:
+        renderer.render_exit()
+
+
+def main() -> None:
+    """
+    CLI for feed processing
+    """
+
+    args = parse_arguments()
+
     logging.basicConfig(format="%(asctime)s %(message)s", level=args.log_level)
 
     try:
         logging.info("Parsed arguments: %s", args)
         if args.cleanup:
-            FileCacheFeedMapper.reset_cache()
+            AppFileCache.reset_cache()
         if args.url or args.date:
-            feed_processor(args.url, args.limit, args.json, args.date)
+            feed_processor(
+                args.url,
+                args.limit,
+                args.json,
+                args.date,
+                args.to_html,
+                args.to_epub,
+            )
     except ContentUnreachable:
         print("Error happened as content cannot be loaded from", args.url)
         sys.exit(10)
@@ -876,15 +1380,25 @@ def main() -> None:  # pylint: disable=too-many-statements
         print("Error happened as there is no RSS at", args.url)
         sys.exit(20)
     except CacheEmpty:
-        print("Error happened as there is no data in cache for", args.date)
+        print(
+            "Error happened as there is no data in cache for",
+            args.date,
+            f"and url {args.url}" if args.url else "",
+        )
         sys.exit(30)
     except CacheIssue:
         print("Working with cache failed. Try calling script with --cleanup")
         sys.exit(40)
+    except HtmlExportIssue:
+        print("Cannot export to", args.to_html)
+        sys.exit(50)
+    except EpubExportIssue:
+        print("Cannot export to", args.to_epub)
+        sys.exit(60)
     except Exception as ex:  # pylint: disable=broad-except
         logging.info("Exception was raised '%s'", ex)
         print("Error happened during program execution.")
-        raise  # sys.exit(100)
+        sys.exit(100)
 
 
 if __name__ == "__main__":
