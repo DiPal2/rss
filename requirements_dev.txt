@@ -4,4 +4,4 @@ black>=22
 pylint>=2.14
 mypy>=0.9
 types-dateparser>=1.1
-types-requests>=2.27
+types-requests>=2.28
